@@ -78,7 +78,9 @@ func (s *PTCPSession) Send(body []byte) *PTCPPacket {
 }
 
 func (s *PTCPSession) Receive(p *PTCPPacket) *PTCPPacket {
-	s.Recv += uint32(len(p.Body))
+	if p.Sent+uint32(len(p.Body)) > s.Recv {
+		s.Recv = p.Sent + uint32(len(p.Body))
+	}
 	s.RMID = p.LMID
 	return p
 }
@@ -105,7 +107,11 @@ func MakeFinalBody() []byte {
 }
 
 func MakeHeartbeatBody() []byte {
-	return []byte{}
+	return []byte{
+		0x13, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
 }
 
 func MakePayloadBody(realm uint32, data []byte) []byte {

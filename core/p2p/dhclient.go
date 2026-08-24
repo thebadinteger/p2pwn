@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -16,12 +17,24 @@ const (
 	Version    = "5.0.0"
 )
 
+var ErrChannelAuthRequired = errors.New("p2p-channel requires authentication (code 403)")
 
+func IsChannelAuthRequired(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrChannelAuthRequired) || strings.Contains(err.Error(), "403")
+}
 
 type DHClient struct {
 	serial        string
 	username      string
 	userkey       string
+	dtype         int    // 0 = no auth, 1 = Type 1 auth
+	deviceUser    string // camera username
+	devicePass    string // camera password
+	randsalt      string // salt from info blob or empty
+	pwnedAuth     bool   // true if successfully authenticated via Type 1
 	p2pServerAddr string
 	relayAddr     string
 	agentAddr     string
@@ -52,6 +65,21 @@ func NewDHClient(serial string, debug bool) *DHClient {
 		userkey:  DefaultUserKey,
 		debug:    debug,
 	}
+}
+
+func (c *DHClient) SetDeviceAuth(username, password, randsalt string) {
+	c.dtype = 1
+	c.deviceUser = username
+	c.devicePass = password
+	c.randsalt = randsalt
+}
+
+func (c *DHClient) GetDeviceAuth() (user, pass, randsalt string, isType1 bool) {
+	return c.deviceUser, c.devicePass, c.randsalt, c.dtype > 0
+}
+
+func (c *DHClient) IsPwnedAuth() bool {
+	return c.pwnedAuth
 }
 
 func (c *DHClient) newUDPConn() (*net.UDPConn, int, error) {
@@ -297,10 +325,21 @@ func (c *DHClient) Handshake() error {
 	}
 
 	laddr := fmt.Sprintf("127.0.0.1:%d", c.deviceConn.LocalAddr().(*net.UDPAddr).Port)
-	bodyXML := fmt.Sprintf("<body><Identify>%s</Identify><IpEncrpt>true</IpEncrpt><LocalAddr>%s</LocalAddr><version>%s</version></body>",
-		string(identify), laddr, Version)
-
 	c.deviceLAddr = laddr
+
+	ipaddr := fmt.Sprintf("<IpEncrpt>true</IpEncrpt><LocalAddr>%s</LocalAddr>", laddr)
+	authStr := ""
+	var key []byte
+	if c.dtype > 0 {
+		key = GetP2PKey(c.deviceUser, c.devicePass, c.randsalt)
+		encNonce := GetP2PNonce()
+		encLaddr := GetP2PEnc(key, encNonce, laddr)
+		ipaddr = fmt.Sprintf("<IpEncrptV2>true</IpEncrptV2><LocalAddr>%s</LocalAddr>", encLaddr)
+		authStr = GetP2PAuth(c.deviceUser, key, encNonce, laddr, c.randsalt)
+	}
+
+	bodyXML := fmt.Sprintf("<body>%s<Identify>%s</Identify>%s<version>%s</version></body>",
+		authStr, string(identify), ipaddr, Version)
 
 	pcReq := c.buildRequest("DHPOST", "/device/"+c.serial+"/p2p-channel", bodyXML)
 	if err := c.sendTo(c.deviceConn, MainServer, []byte(pcReq)); err != nil {
@@ -355,6 +394,9 @@ func (c *DHClient) Handshake() error {
 	}
 
 	if resp.Code >= 400 {
+		if resp.Code == 403 {
+			return ErrChannelAuthRequired
+		}
 		return fmt.Errorf("p2p-channel error %d: %s", resp.Code, resp.Body)
 	}
 
@@ -364,7 +406,21 @@ func (c *DHClient) Handshake() error {
 		return fmt.Errorf("no device address in p2p-channel response")
 	}
 
-	rcBody := fmt.Sprintf("<body><agentAddr>%s</agentAddr></body>", c.agentAddr)
+	if c.dtype > 0 {
+		nonceStr := resp.XMLBody["body/Nonce"]
+		if nonceStr != "" {
+			nonceVal, _ := strconv.Atoi(nonceStr)
+			c.cameraLAddr = GetP2PDec(key, nonceVal, c.cameraLAddr)
+		}
+		c.pwnedAuth = true
+	}
+
+	relayAuthStr := ""
+	if c.dtype > 0 {
+		nonce2 := GetP2PNonce()
+		relayAuthStr = GetP2PAuth(c.deviceUser, key, nonce2, "", c.randsalt)
+	}
+	rcBody := fmt.Sprintf("<body>%s<agentAddr>%s</agentAddr></body>", relayAuthStr, c.agentAddr)
 	rcReq := c.buildRequest("DHPOST", "/device/"+c.serial+"/relay-channel", rcBody)
 	if err := c.sendTo(c.mainConn, MainServer, []byte(rcReq)); err != nil {
 		return fmt.Errorf("relay-channel send: %w", err)
@@ -390,10 +446,6 @@ func (c *DHClient) EstablishDirectP2P() error {
 	deviceHost, devicePortStr, _ := net.SplitHostPort(deviceAddr)
 	devicePort, _ := strconv.Atoi(devicePortStr)
 	deviceIP := net.ParseIP(deviceHost)
-
-	camLHost, camLPortStr, _ := net.SplitHostPort(c.cameraLAddr)
-	camLPort, _ := strconv.Atoi(camLPortStr)
-	camLIP := net.ParseIP(camLHost)
 
 	invertedAid := make([]byte, 8)
 	for i, b := range c.aid {
@@ -427,52 +479,84 @@ func (c *DHClient) EstablishDirectP2P() error {
 		c.sendTo(c.deviceConn, target, pkt1)
 	}
 
-	c.deviceConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var stunResponse []byte
+	var cameraDirectAddr string
 	buf := make([]byte, 4096)
-	n, respAddr, err := c.deviceConn.ReadFrom(buf)
-	if err != nil {
-		return fmt.Errorf("inverted stun response: %w", err)
-	}
-	respData := buf[:n]
+	c.deviceConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	deadline := time.Now().Add(10 * time.Second)
+	attempt := 0
 
-	respHost := respAddr.(*net.UDPAddr).IP.String()
-	respPort := respAddr.(*net.UDPAddr).Port
-	cameraDirectAddr := net.JoinHostPort(respHost, strconv.Itoa(respPort))
+	for time.Now().Before(deadline) {
+		n, respAddr, err := c.deviceConn.ReadFrom(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				attempt++
+				if attempt <= 2 {
+					for _, target := range targets {
+						c.sendTo(c.deviceConn, target, pkt1)
+					}
+				}
+				c.deviceConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				continue
+			}
+			break
+		}
+		if n < 4 {
+			continue
+		}
+		data := buf[:n]
+		magic := string(data[:4])
+
+		if magic == "\xfe\xfe\xff\xe7" {
+			stunResponse = data
+			respHost := respAddr.(*net.UDPAddr).IP.String()
+			respPort := respAddr.(*net.UDPAddr).Port
+			cameraDirectAddr = net.JoinHostPort(respHost, strconv.Itoa(respPort))
+			break
+		} else if magic == "\xff\xfe\xff\xe7" {
+			// Cross-STUN init from device
+			if n >= 40 {
+				resp := make([]byte, 0, 40)
+				resp = append(resp, []byte{0xfe, 0xfe, 0xff, 0xe7}...)
+				resp = append(resp, data[4:8]...)
+				resp = append(resp, data[8:20]...)
+				resp = append(resp, []byte{0x7f, 0xd6, 0xff, 0xf7}...)
+				resp = append(resp, invertedAid...)
+				resp = append(resp, []byte{0xff, 0xfb, 0xff, 0xf7, 0xff, 0xfe}...)
+				resp = append(resp, data[34:40]...)
+				c.sendTo(c.deviceConn, respAddr.String(), resp)
+			}
+		}
+	}
+
+	if stunResponse == nil {
+		return fmt.Errorf("inverted stun: no response received")
+	}
+
 	c.deviceRAddr = cameraDirectAddr
 	deviceAddr = cameraDirectAddr
 
-	if len(respData) < 20 {
-		return fmt.Errorf("inverted stun response too short: %d", len(respData))
-	}
-	rtransID := respData[8:20]
-
-	eaddr2 := make([]byte, 6)
-	binary.BigEndian.PutUint16(eaddr2[0:2], uint16(camLPort))
-	copy(eaddr2[2:6], camLIP.To4())
-	for i, b := range eaddr2 {
-		eaddr2[i] = 0xFF - b
-	}
-
-	pkt2 := make([]byte, 0, 44)
-	pkt2 = append(pkt2, []byte{0xfe, 0xfe, 0xff, 0xe7}...)
-	pkt2 = append(pkt2, cookie...)
-	pkt2 = append(pkt2, rtransID...)
-	pkt2 = append(pkt2, []byte{0x7f, 0xd6, 0xff, 0xf7}...)
-	pkt2 = append(pkt2, invertedAid...)
-	pkt2 = append(pkt2, []byte{0xff, 0xfb, 0xff, 0xf7, 0xff, 0xfe}...)
-	pkt2 = append(pkt2, eaddr2...)
-
-	if err := c.sendTo(c.deviceConn, cameraDirectAddr, pkt2); err != nil {
-		return fmt.Errorf("inverted stun #2: %w", err)
-	}
+	// Send STUN confirm (0xfe 0xfe 0xff 0xf3) 5 times
+	confirm := make([]byte, 0, 28)
+	confirm = append(confirm, []byte{0xfe, 0xfe, 0xff, 0xf3}...)
+	confirm = append(confirm, cookie...)
+	confirm = append(confirm, transID...)
+	confirm = append(confirm, []byte{0x7f, 0xd6, 0xff, 0xf7}...)
+	confirm = append(confirm, invertedAid...)
 
 	for i := 0; i < 5; i++ {
-		c.deviceConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		_, _, err = c.deviceConn.ReadFrom(buf)
+		c.sendTo(c.deviceConn, deviceAddr, confirm)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	c.deviceConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for {
+		_, _, err := c.deviceConn.ReadFrom(buf)
 		if err != nil {
 			break
 		}
 	}
+	c.deviceConn.SetReadDeadline(time.Time{})
 
 	c.devicePTCPSession = NewPTCPSession()
 
@@ -482,7 +566,7 @@ func (c *DHClient) EstablishDirectP2P() error {
 	}
 
 	c.deviceConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, _, err = c.deviceConn.ReadFrom(buf)
+	n, _, err := c.deviceConn.ReadFrom(buf)
 	if err != nil {
 		return fmt.Errorf("direct ptcp syn-ack: %w", err)
 	}
@@ -687,10 +771,15 @@ func (c *DHClient) StartHeartbeat(stop chan struct{}) {
 		for {
 			select {
 			case <-ticker.C:
-				if c.ptcpSession != nil && c.mainConn != nil {
+				if c.ptcpSession != nil && c.mainConn != nil && c.agentAddr != "" {
 					hb := MakeHeartbeatBody()
 					pkt := c.ptcpSession.Send(hb)
 					c.mainConn.WriteTo(pkt.Serialize(), parseUDPAddr(c.agentAddr))
+				}
+				if c.devicePTCPSession != nil && c.deviceConn != nil && c.deviceRAddr != "" {
+					hb := MakeHeartbeatBody()
+					pkt := c.devicePTCPSession.Send(hb)
+					c.deviceConn.WriteTo(pkt.Serialize(), parseUDPAddr(c.deviceRAddr))
 				}
 			case <-stop:
 				return
