@@ -58,6 +58,7 @@ func isDirReadOnly(dir string) bool {
 }
 
 func main() {
+	core.InitConsole()
 	args := os.Args[1:]
 
 	if len(args) == 0 {

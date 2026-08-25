@@ -231,7 +231,11 @@ func (s *SDKClient) loginOnBindSingle(realm uint32) error {
 }
 
 func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
-	ch := byte(channel)
+	ch := byte(0)
+	if channel > 0 {
+		ch = byte(channel - 1)
+	}
+
 	cmd := []byte{
 		0x11, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
@@ -295,7 +299,15 @@ func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
 		data = data[32:]
 	}
 
-	data = stripSnapshotGarbage(data, channel)
+	data = stripSnapshotGarbage(data, ch)
+
+	if soi := bytes.Index(data, []byte{0xff, 0xd8}); soi >= 0 {
+		data = data[soi:]
+		if eoi := bytes.LastIndex(data, []byte{0xff, 0xd9}); eoi >= 0 {
+			data = data[:eoi+2]
+		}
+	}
+
 	return data, nil
 }
 
@@ -303,8 +315,7 @@ func containsJPEGEnd(data []byte) bool {
 	return bytes.Contains(data, []byte{0xff, 0xd9})
 }
 
-func stripSnapshotGarbage(data []byte, channel int) []byte {
-	ch := byte(channel)
+func stripSnapshotGarbage(data []byte, ch byte) []byte {
 	garbage1 := []byte{0x0a, ch, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00}
 	garbage2 := []byte{0xbc, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, ch}
 
@@ -328,7 +339,7 @@ func stripSnapshotGarbage(data []byte, channel int) []byte {
 		if idx < 0 {
 			break
 		}
-		end := idx + 24
+		end := idx + 32
 		if end > len(data) {
 			end = len(data)
 		}

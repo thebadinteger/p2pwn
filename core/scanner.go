@@ -476,7 +476,17 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 			client.SetRetries(retries)
 			if err := client.Handshake(); err != nil {
 				client.Close()
-				continue
+				if p2p.IsChannelAuthRequired(err) && login != "" && password != "" {
+					client = p2p.NewDHClient(serial, false)
+					client.SetRetries(retries)
+					client.SetDeviceAuth(login, password, "")
+					if err := client.Handshake(); err != nil {
+						client.Close()
+						continue
+					}
+				} else {
+					continue
+				}
 			}
 			if err := client.PTCPHandshake(); err != nil {
 				client.Close()

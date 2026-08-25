@@ -617,8 +617,11 @@ func (t *PTCPTunnel) DoHTTPOnRealm(realm uint32, req []byte, timeout time.Durati
 			continue
 		}
 
-		
-		continue
+		if containsJPEGEnd(fullResp[headerEnd:]) {
+			return fullResp, nil
+		}
+
+		return fullResp, nil
 	}
 }
 
@@ -1228,10 +1231,26 @@ func (t *PTCPTunnel) Snapshot(channel int) ([]byte, error) {
 	}
 	defer t.DisconnectRealm(realm)
 
-	req := "GET /cgi-bin/snapshot.cgi?channel=1 HTTP/1.0\r\nHost: 127.0.0.1\r\nUser-Agent: Mozilla/5.0\r\nAccept: image/jpeg\r\n\r\n"
+	ch := channel
+	if ch <= 0 {
+		ch = 1
+	}
+
+	req := fmt.Sprintf("GET /cgi-bin/snapshot.cgi?channel=%d HTTP/1.0\r\nHost: 127.0.0.1\r\nUser-Agent: Mozilla/5.0\r\nAccept: image/jpeg\r\n\r\n", ch)
 	resp, err := t.DoHTTPAuthOnRealm(realm, []byte(req), 60*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: %w", err)
+	}
+
+	soiIdx := bytes.Index(resp, []byte{0xFF, 0xD8})
+	if soiIdx >= 0 {
+		jpegData := resp[soiIdx:]
+		if eoiIdx := bytes.LastIndex(jpegData, []byte{0xFF, 0xD9}); eoiIdx >= 0 {
+			return jpegData[:eoiIdx+2], nil
+		}
+		if len(jpegData) >= 1000 {
+			return jpegData, nil
+		}
 	}
 
 	body := extractBody(resp)
