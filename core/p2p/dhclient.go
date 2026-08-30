@@ -30,11 +30,6 @@ type DHClient struct {
 	serial        string
 	username      string
 	userkey       string
-	dtype         int    // 0 = no auth, 1 = Type 1 auth
-	deviceUser    string // camera username
-	devicePass    string // camera password
-	randsalt      string // salt from info blob or empty
-	pwnedAuth     bool   // true if successfully authenticated via Type 1
 	p2pServerAddr string
 	relayAddr     string
 	agentAddr     string
@@ -44,7 +39,6 @@ type DHClient struct {
 	devicePTCPSession *PTCPSession // separate PTCP session for direct device path
 	cseq          int
 	lport         int
-	debug         bool
 	timeout       time.Duration
 	retries       int
 
@@ -52,7 +46,6 @@ type DHClient struct {
 	mainConn    *net.UDPConn  // main_remote
 	deviceConn  *net.UDPConn  // device_remote
 
-	sessionID string // HTTP session cookie from RPC2_Login
 	aid         []byte // random aid
 	sign        []byte // sign from relay
 	cameraLAddr string // camera local addr
@@ -63,23 +56,7 @@ func NewDHClient(serial string, debug bool) *DHClient {
 		serial:   serial,
 		username: DefaultUsername,
 		userkey:  DefaultUserKey,
-		debug:    debug,
 	}
-}
-
-func (c *DHClient) SetDeviceAuth(username, password, randsalt string) {
-	c.dtype = 1
-	c.deviceUser = username
-	c.devicePass = password
-	c.randsalt = randsalt
-}
-
-func (c *DHClient) GetDeviceAuth() (user, pass, randsalt string, isType1 bool) {
-	return c.deviceUser, c.devicePass, c.randsalt, c.dtype > 0
-}
-
-func (c *DHClient) IsPwnedAuth() bool {
-	return c.pwnedAuth
 }
 
 func (c *DHClient) newUDPConn() (*net.UDPConn, int, error) {
@@ -99,11 +76,6 @@ func (c *DHClient) sendTo(conn *net.UDPConn, addr string, data []byte) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
-	}
-	if c.debug {
-		disp := string(data[:min(len(data), 256)])
-		disp = strings.ReplaceAll(disp, "\r\n", " | ")
-		fmt.Printf("[UDP >>> %s] %s\n", addr, disp)
 	}
 	_, err = conn.WriteTo(data, udpAddr)
 	return err
@@ -328,18 +300,8 @@ func (c *DHClient) Handshake() error {
 	c.deviceLAddr = laddr
 
 	ipaddr := fmt.Sprintf("<IpEncrpt>true</IpEncrpt><LocalAddr>%s</LocalAddr>", laddr)
-	authStr := ""
-	var key []byte
-	if c.dtype > 0 {
-		key = GetP2PKey(c.deviceUser, c.devicePass, c.randsalt)
-		encNonce := GetP2PNonce()
-		encLaddr := GetP2PEnc(key, encNonce, laddr)
-		ipaddr = fmt.Sprintf("<IpEncrptV2>true</IpEncrptV2><LocalAddr>%s</LocalAddr>", encLaddr)
-		authStr = GetP2PAuth(c.deviceUser, key, encNonce, laddr, c.randsalt)
-	}
-
-	bodyXML := fmt.Sprintf("<body>%s<Identify>%s</Identify>%s<version>%s</version></body>",
-		authStr, string(identify), ipaddr, Version)
+	bodyXML := fmt.Sprintf("<body><Identify>%s</Identify>%s<version>%s</version></body>",
+		string(identify), ipaddr, Version)
 
 	pcReq := c.buildRequest("DHPOST", "/device/"+c.serial+"/p2p-channel", bodyXML)
 	if err := c.sendTo(c.deviceConn, MainServer, []byte(pcReq)); err != nil {
@@ -406,21 +368,7 @@ func (c *DHClient) Handshake() error {
 		return fmt.Errorf("no device address in p2p-channel response")
 	}
 
-	if c.dtype > 0 {
-		nonceStr := resp.XMLBody["body/Nonce"]
-		if nonceStr != "" {
-			nonceVal, _ := strconv.Atoi(nonceStr)
-			c.cameraLAddr = GetP2PDec(key, nonceVal, c.cameraLAddr)
-		}
-		c.pwnedAuth = true
-	}
-
-	relayAuthStr := ""
-	if c.dtype > 0 {
-		nonce2 := GetP2PNonce()
-		relayAuthStr = GetP2PAuth(c.deviceUser, key, nonce2, "", c.randsalt)
-	}
-	rcBody := fmt.Sprintf("<body>%s<agentAddr>%s</agentAddr></body>", relayAuthStr, c.agentAddr)
+	rcBody := fmt.Sprintf("<body><agentAddr>%s</agentAddr></body>", c.agentAddr)
 	rcReq := c.buildRequest("DHPOST", "/device/"+c.serial+"/relay-channel", rcBody)
 	if err := c.sendTo(c.mainConn, MainServer, []byte(rcReq)); err != nil {
 		return fmt.Errorf("relay-channel send: %w", err)
@@ -805,11 +753,6 @@ func (c *DHClient) recvResend(conn *net.UDPConn, addr string, reqData []byte, at
 		conn.SetReadDeadline(time.Now().Add(attemptTimeout))
 		n, _, err := conn.ReadFrom(buf)
 		if err == nil {
-			if c.debug {
-				disp := string(buf[:min(n, 256)])
-				disp = strings.ReplaceAll(disp, "\r\n", " | ")
-				fmt.Printf("[UDP <<< %s] %s\n", conn.LocalAddr().String(), disp)
-			}
 			return buf[:n], nil
 		}
 	}

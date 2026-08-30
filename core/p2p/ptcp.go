@@ -133,7 +133,7 @@ func ParsePayloadBody(body []byte) (realm uint32, payload []byte, err error) {
 	if pad != 0 {
 		return 0, nil, fmt.Errorf("invalid padding: %d", pad)
 	}
-	actualLen := length & 0xFFFF
+	actualLen := length & 0x0FFFFFFF
 	payload = body[12:]
 	if uint32(len(payload)) != actualLen {
 		return 0, nil, fmt.Errorf("payload length mismatch: expected %d, got %d", actualLen, len(payload))

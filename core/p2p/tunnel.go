@@ -12,6 +12,8 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -399,47 +401,7 @@ func (t *PTCPTunnel) DoHTTP(req []byte, timeout time.Duration) ([]byte, error) {
 	return t.doHTTP(req, timeout)
 }
 
-func selectAuthHeader(reqStr string, authHeaders []string, user, pass string) string {
-	selected := ""
-	priority := 0 
-	for _, h := range authHeaders {
-		var p int
-		switch {
-		case strings.HasPrefix(h, "Digest"):
-			p = 4
-		case strings.HasPrefix(h, "Basic"):
-			p = 3
-		case strings.HasPrefix(h, "WSSE"):
-			p = 2
-		default:
-			p = 1
-		}
-		if p > priority {
-			priority = p
-			selected = h
-		}
-	}
-	if selected == "" {
-		return ""
-	}
 
-	if strings.HasPrefix(selected, "Digest") {
-		method := "GET"
-		uri := "/"
-		if parts := strings.SplitN(reqStr, " ", 3); len(parts) >= 2 {
-			method = parts[0]
-			uri = parts[1]
-		}
-		return digestAuthHeader(user, pass, method, uri, selected)
-	}
-	if strings.HasPrefix(selected, "Basic") {
-		return basicAuthHeader(user, pass)
-	}
-	if strings.HasPrefix(selected, "WSSE") {
-		return wsseAuthHeader(user, pass)
-	}
-	return wsseAuthHeader(user, pass)
-}
 
 func parseWWWAuthHeaders(respStr string) []string {
 	var authHeaders []string
@@ -457,9 +419,6 @@ func parseWWWAuthHeaders(respStr string) []string {
 
 func (t *PTCPTunnel) DoHTTPAuth(req []byte, timeout time.Duration) ([]byte, error) {
 	reqStr := string(req)
-	if t.client.sessionID != "" && !strings.Contains(reqStr, "Cookie:") {
-		reqStr = addHeader(reqStr, "Cookie", "WebClientSessionID="+t.client.sessionID)
-	}
 	noAuthReq := removeAuthHeader(reqStr)
 	resp, err := t.doHTTP([]byte(noAuthReq), timeout)
 	if err != nil {
@@ -484,11 +443,68 @@ func (t *PTCPTunnel) DoHTTPAuth(req []byte, timeout time.Duration) ([]byte, erro
 	return t.doHTTP([]byte(authReq), timeout)
 }
 
+func (t *PTCPTunnel) DoHTTPAuthStrict(req []byte, timeout time.Duration) ([]byte, error) {
+	realm1 := rand.Uint32()
+	if err := t.doBind(realm1); err != nil {
+		return nil, fmt.Errorf("bind: %w", err)
+	}
+	defer t.DisconnectRealm(realm1)
+
+	reqStr := string(req)
+	noAuthReq := removeAuthHeader(reqStr)
+	resp, err := t.DoHTTPOnRealm(realm1, []byte(noAuthReq), timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	respStr := string(resp)
+	if !strings.Contains(respStr, "401 Unauthorized") {
+		return nil, fmt.Errorf("endpoint is unauthenticated (no 401 challenge)")
+	}
+
+	authHeaders := parseWWWAuthHeaders(respStr)
+	if len(authHeaders) == 0 {
+		return nil, fmt.Errorf("no auth headers in 401 response")
+	}
+
+	// Try Digest variants on fresh realm
+	for variant := 0; variant < 4; variant++ {
+		selected := selectAuthHeaderVariant(reqStr, authHeaders, t.user, t.pass, variant)
+		if selected == "" {
+			continue
+		}
+		authReq := insertAuthHeader(reqStr, selected)
+		realm2 := rand.Uint32()
+		if err := t.doBind(realm2); err != nil {
+			continue
+		}
+		authResp, authErr := t.DoHTTPOnRealm(realm2, []byte(authReq), timeout)
+		t.DisconnectRealm(realm2)
+		if authErr == nil && len(authResp) > 0 {
+			resStr := string(authResp)
+			if strings.Contains(resStr, "200 OK") && !strings.Contains(resStr, "401 Unauthorized") && !strings.Contains(resStr, "Invalid Authority") {
+				return authResp, nil
+			}
+		}
+	}
+
+	// Try Basic Auth fallback on fresh realm
+	basicAuth := basicAuthHeader(t.user, t.pass)
+	authReq := insertAuthHeader(reqStr, basicAuth)
+	realmBasic := rand.Uint32()
+	if err := t.doBind(realmBasic); err == nil {
+		authResp, authErr := t.DoHTTPOnRealm(realmBasic, []byte(authReq), timeout)
+		t.DisconnectRealm(realmBasic)
+		if authErr == nil && len(authResp) > 0 && strings.Contains(string(authResp), "200 OK") && !strings.Contains(string(authResp), "401 Unauthorized") && !strings.Contains(string(authResp), "Invalid Authority") {
+			return authResp, nil
+		}
+	}
+
+	return nil, fmt.Errorf("authentication failed")
+}
+
 func (t *PTCPTunnel) DoHTTPAuthOnRealm(realm uint32, req []byte, timeout time.Duration) ([]byte, error) {
 	reqStr := string(req)
-	if t.client.sessionID != "" && !strings.Contains(reqStr, "Cookie:") {
-		reqStr = addHeader(reqStr, "Cookie", "WebClientSessionID="+t.client.sessionID)
-	}
 	noAuthReq := removeAuthHeader(reqStr)
 	resp, err := t.DoHTTPOnRealm(realm, []byte(noAuthReq), timeout)
 	if err != nil {
@@ -585,13 +601,18 @@ func (t *PTCPTunnel) DoHTTPOnRealm(realm uint32, req []byte, timeout time.Durati
 	}
 
 	var fullResp []byte
-	for {
-		data, err := t.readHTTPPayload(realm, fullResp, timeout)
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		data, err := t.readHTTPPayload(realm, fullResp, 2*time.Second)
 		if err != nil {
 			if len(fullResp) > 0 {
 				return fullResp, nil
 			}
-			return nil, fmt.Errorf("read http on realm: %w", err)
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("read http on realm: %w", err)
+			}
+			continue
 		}
 		fullResp = append(fullResp, data...)
 
@@ -600,8 +621,13 @@ func (t *PTCPTunnel) DoHTTPOnRealm(realm uint32, req []byte, timeout time.Durati
 			continue
 		}
 
-		bodyLen := len(fullResp) - headerEnd
-		cl := parseContentLength(string(fullResp))
+		headers := string(fullResp[:headerEnd])
+		headersLower := strings.ToLower(headers)
+		body := fullResp[headerEnd:]
+		bodyLen := len(body)
+
+		// 1. Content-Length check
+		cl := parseContentLength(headers)
 		if cl > 0 {
 			if bodyLen >= cl {
 				return fullResp, nil
@@ -609,20 +635,49 @@ func (t *PTCPTunnel) DoHTTPOnRealm(realm uint32, req []byte, timeout time.Durati
 			continue
 		}
 
-		bodyStr := string(fullResp[headerEnd:])
-		if contains(fullResp, "transfer-encoding: chunked") || strings.HasSuffix(bodyStr, "0\r\n\r\n") {
-			if strings.HasSuffix(bodyStr, "0\r\n\r\n") {
+		// 2. Chunked Transfer Encoding check
+		if strings.Contains(headersLower, "transfer-encoding: chunked") {
+			if strings.HasSuffix(string(body), "0\r\n\r\n") || bytes.Contains(body, []byte("\r\n0\r\n\r\n")) {
 				return fullResp, nil
 			}
 			continue
 		}
 
-		if containsJPEGEnd(fullResp[headerEnd:]) {
-			return fullResp, nil
+		// 3. JPEG image stream check
+		if strings.Contains(headersLower, "image/jpeg") || (len(body) >= 2 && body[0] == 0xFF && body[1] == 0xD8) {
+			if containsJPEGEnd(body) {
+				for {
+					extra, eErr := t.readHTTPPayload(realm, fullResp, 40*time.Millisecond)
+					if eErr != nil || len(extra) == 0 {
+						break
+					}
+					fullResp = append(fullResp, extra...)
+				}
+				return fullResp, nil
+			}
+			continue
 		}
 
+		// 4. Standard text/error/JSON response without Content-Length
+		if strings.Contains(headers, "401 Unauthorized") || strings.Contains(headers, "403 Forbidden") || strings.Contains(headers, "404 Not Found") ||
+			strings.Contains(headersLower, "text/") || strings.Contains(headersLower, "application/") ||
+			strings.Contains(string(body), "table.") || strings.Contains(string(body), "users[") || strings.Contains(string(body), "user.Name=") ||
+			strings.Contains(string(body), "result") || strings.Contains(string(body), "version=") || strings.Contains(string(body), "type=") {
+			for {
+				extra, eErr := t.readHTTPPayload(realm, fullResp, 40*time.Millisecond)
+				if eErr != nil || len(extra) == 0 {
+					break
+				}
+				fullResp = append(fullResp, extra...)
+			}
+			return fullResp, nil
+		}
+	}
+
+	if len(fullResp) > 0 {
 		return fullResp, nil
 	}
+	return nil, fmt.Errorf("read http on realm: timeout")
 }
 
 
@@ -1115,9 +1170,64 @@ func basicAuthHeader(username, password string) string {
 	return "Authorization: Basic " + encoded
 }
 
+func selectAuthHeader(reqStr string, authHeaders []string, user, pass string) string {
+	return selectAuthHeaderVariant(reqStr, authHeaders, user, pass, 0)
+}
+
+func selectAuthHeaderVariant(reqStr string, authHeaders []string, user, pass string, variant int) string {
+	selected := ""
+	priority := 0 
+	for _, h := range authHeaders {
+		var p int
+		switch {
+		case strings.HasPrefix(h, "Digest"):
+			p = 4
+		case strings.HasPrefix(h, "Basic"):
+			p = 3
+		case strings.HasPrefix(h, "WSSE"):
+			p = 2
+		default:
+			p = 1
+		}
+		if p > priority {
+			priority = p
+			selected = h
+		}
+	}
+	if selected == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(selected, "Digest") {
+		method := "GET"
+		uri := "/"
+		if parts := strings.SplitN(reqStr, " ", 3); len(parts) >= 2 {
+			method = parts[0]
+			uri = parts[1]
+		}
+		return digestAuthHeaderVariant(user, pass, method, uri, selected, variant)
+	}
+	if strings.HasPrefix(selected, "Basic") {
+		return basicAuthHeader(user, pass)
+	}
+	if strings.HasPrefix(selected, "WSSE") {
+		return wsseAuthHeader(user, pass)
+	}
+	return wsseAuthHeader(user, pass)
+}
+
 func digestAuthHeader(username, password, method, uri, wwwAuth string) string {
+	return digestAuthHeaderVariant(username, password, method, uri, wwwAuth, 0)
+}
+
+func digestAuthHeaderVariant(username, password, method, uri, wwwAuth string, variant int) string {
+	authBody := strings.TrimSpace(wwwAuth)
+	if strings.HasPrefix(strings.ToLower(authBody), "digest ") {
+		authBody = strings.TrimSpace(authBody[7:])
+	}
+
 	params := make(map[string]string)
-	for _, part := range strings.Split(wwwAuth, ",") {
+	for _, part := range strings.Split(authBody, ",") {
 		part = strings.TrimSpace(part)
 		if idx := strings.Index(part, "="); idx >= 0 {
 			key := strings.TrimSpace(part[:idx])
@@ -1137,8 +1247,30 @@ func digestAuthHeader(username, password, method, uri, wwwAuth string) string {
 	nc := "00000001"
 	cnonce := fmt.Sprintf("%08x", rand.Uint32())
 
-	ha1 := md5Hex(username + ":" + realm + ":" + password)
-	ha2 := md5Hex(method + ":" + uri)
+	pathOnly := uri
+	if qIdx := strings.Index(uri, "?"); qIdx >= 0 {
+		pathOnly = uri[:qIdx]
+	}
+
+	var ha1 string
+	targetURI := uri
+
+	switch variant {
+	case 1: // Uppercase HA1
+		ha1 = strings.ToUpper(md5Hex(username + ":" + realm + ":" + password))
+		targetURI = uri
+	case 2: // Uppercase HA1 with path-only URI
+		ha1 = strings.ToUpper(md5Hex(username + ":" + realm + ":" + password))
+		targetURI = pathOnly
+	case 3: // Standard HA1 with path-only URI
+		ha1 = md5Hex(username + ":" + realm + ":" + password)
+		targetURI = pathOnly
+	default: // Standard RFC 2617
+		ha1 = md5Hex(username + ":" + realm + ":" + password)
+		targetURI = uri
+	}
+
+	ha2 := md5Hex(method + ":" + targetURI)
 
 	var response string
 	if qop == "auth" || qop == "auth-int" {
@@ -1148,7 +1280,7 @@ func digestAuthHeader(username, password, method, uri, wwwAuth string) string {
 	}
 
 	auth := fmt.Sprintf(`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
-		username, realm, nonce, uri, response)
+		username, realm, nonce, targetURI, response)
 	if opaque != "" {
 		auth += fmt.Sprintf(`, opaque="%s"`, opaque)
 	}
@@ -1225,47 +1357,99 @@ func addHeader(req, name, value string) string {
 }
 
 func (t *PTCPTunnel) Snapshot(channel int) ([]byte, error) {
-	realm := rand.Uint32()
-	if err := t.doBindWithTarget(realm, "127.0.0.1:80"); err != nil {
-		return nil, fmt.Errorf("snapshot bind: %w", err)
-	}
-	defer t.DisconnectRealm(realm)
-
 	ch := channel
 	if ch <= 0 {
 		ch = 1
 	}
 
-	req := fmt.Sprintf("GET /cgi-bin/snapshot.cgi?channel=%d HTTP/1.0\r\nHost: 127.0.0.1\r\nUser-Agent: Mozilla/5.0\r\nAccept: image/jpeg\r\n\r\n", ch)
-	resp, err := t.DoHTTPAuthOnRealm(realm, []byte(req), 60*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot: %w", err)
+	urls := []string{
+		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d", ch),
+		fmt.Sprintf("/cgi-bin/snapshot.cgi?chn=%d", ch),
+		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d", ch-1),
+		fmt.Sprintf("/cgi-bin/snapshot.cgi?chn=%d", ch-1),
+		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d", 0),
+		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d&loginuse=%s&loginpas=%s", ch, url.QueryEscape(t.user), url.QueryEscape(t.pass)),
+		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d&loginuse=%s&loginpas=%s", ch-1, url.QueryEscape(t.user), url.QueryEscape(t.pass)),
+		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d&loginuse=%s&loginpas=%s", 0, url.QueryEscape(t.user), url.QueryEscape(t.pass)),
 	}
 
-	soiIdx := bytes.Index(resp, []byte{0xFF, 0xD8})
-	if soiIdx >= 0 {
-		jpegData := resp[soiIdx:]
-		if eoiIdx := bytes.LastIndex(jpegData, []byte{0xFF, 0xD9}); eoiIdx >= 0 {
-			return jpegData[:eoiIdx+2], nil
+	for _, u := range urls {
+		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: Mozilla/5.0\r\nAccept: image/jpeg,image/webp,image/*,*/*\r\nConnection: close\r\n\r\n", u)
+		resp, err := t.DoHTTPAuth([]byte(req), 10*time.Second)
+		if err != nil || len(resp) == 0 {
+			continue
 		}
-		if len(jpegData) >= 1000 {
+		if jpegData, ok := ExtractJPEG(resp); ok {
 			return jpegData, nil
 		}
 	}
 
-	body := extractBody(resp)
-	if len(body) > 2 && body[0] == 0xFF && body[1] == 0xD8 {
-		return body, nil
-	}
-
-	statusLine := string(resp)
-	if idx := strings.Index(statusLine, "\r\n"); idx >= 0 {
-		statusLine = statusLine[:idx]
-	}
-	bodyPreview := string(body[:min(len(body), 120)])
-	return nil, fmt.Errorf("snapshot: %s body=%q", statusLine, bodyPreview)
+	return nil, fmt.Errorf("snapshot failed on all CGI URL variants")
 }
 
+func ExtractJPEG(resp []byte) ([]byte, bool) {
+	headerEnd := findHeaderEnd(resp)
+	if headerEnd < 0 {
+		return nil, false
+	}
+	headers := string(resp[:headerEnd])
+	body := resp[headerEnd:]
+
+	if strings.Contains(strings.ToLower(headers), "transfer-encoding: chunked") {
+		body = DechunkHTTP(body)
+	}
+
+	soi := bytes.Index(body, []byte{0xFF, 0xD8})
+	if soi < 0 {
+		return nil, false
+	}
+	jpeg := body[soi:]
+	eoi := bytes.LastIndex(jpeg, []byte{0xFF, 0xD9})
+	if eoi < 0 {
+		return nil, false
+	}
+	finalJPEG := jpeg[:eoi+2]
+	if len(finalJPEG) < 1000 {
+		return nil, false
+	}
+	return finalJPEG, true
+}
+
+func DechunkHTTP(data []byte) []byte {
+	var out []byte
+	remaining := data
+	for len(remaining) > 0 {
+		idx := bytes.Index(remaining, []byte("\r\n"))
+		if idx < 0 {
+			break
+		}
+		hexStr := strings.TrimSpace(string(remaining[:idx]))
+		if extIdx := strings.Index(hexStr, ";"); extIdx >= 0 {
+			hexStr = hexStr[:extIdx]
+		}
+		chunkSize, err := strconv.ParseInt(hexStr, 16, 64)
+		if err != nil || chunkSize < 0 {
+			return data
+		}
+		if chunkSize == 0 {
+			break
+		}
+		remaining = remaining[idx+2:]
+		if int64(len(remaining)) < chunkSize {
+			out = append(out, remaining...)
+			break
+		}
+		out = append(out, remaining[:chunkSize]...)
+		remaining = remaining[chunkSize:]
+		if len(remaining) >= 2 && remaining[0] == '\r' && remaining[1] == '\n' {
+			remaining = remaining[2:]
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	return data
+}
 
 func extractBody(resp []byte) []byte {
 	idx := findHeaderEnd(resp)
