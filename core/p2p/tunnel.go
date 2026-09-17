@@ -676,10 +676,6 @@ type DHIPClient struct {
 
 var dhipMagic = []byte{0x20, 0x00, 0x00, 0x00, 0x44, 0x48, 0x49, 0x50}
 
-func (t *PTCPTunnel) NewDHIPClient() (*DHIPClient, error) {
-	return t.NewDHIPClientOnPort(80)
-}
-
 func (t *PTCPTunnel) NewDHIPClientOnPort(port int) (*DHIPClient, error) {
 	realm := rand.Uint32()
 	if err := t.doBindWithTarget(realm, fmt.Sprintf("127.0.0.1:%d", port)); err != nil {
@@ -772,24 +768,6 @@ func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 		return nil, fmt.Errorf("dhip json: %w", err)
 	}
 	return pkt, nil
-}
-
-func (c *DHIPClient) readBytes(n int, timeout time.Duration) ([]byte, error) {
-	out := make([]byte, 0, n)
-	deadline := time.Now().Add(timeout)
-	for len(out) < n {
-		chunk, err := c.tunnel.readOneDataForRealm(c.realm, time.Until(deadline))
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, chunk...)
-	}
-
-	if len(out) > n {
-		c.tunnel.recvBufs[c.realm] = append(out[n:], c.tunnel.recvBufs[c.realm]...)
-		out = out[:n]
-	}
-	return out, nil
 }
 
 func (c *DHIPClient) Call(method string, params any, id int, object any, notifies *[]map[string]any) (map[string]any, error) {
@@ -992,6 +970,93 @@ func (c *DHIPClient) LoginLoopback() error {
 	}
 
 	return fmt.Errorf("dhip loopback: all login paths failed (realm=%s)", realm)
+}
+
+func (c *DHIPClient) LoginLoopbackRealm() (string, error) {
+	loopParams := func(pwd, enc string) map[string]any {
+		return map[string]any{
+			"userName": "admin", "password": pwd,
+			"clientType": "Local", "loginType": "Loopback", "ipAddr": "127.0.0.1",
+			"authorityType": "Default", "passwordType": enc,
+		}
+	}
+	sessOf := func(r map[string]any) int {
+		if s, ok := r["session"].(float64); ok && s != 0 {
+			return int(s)
+		}
+		if p, ok := r["params"].(map[string]any); ok {
+			if s, ok := p["session"].(float64); ok && s != 0 {
+				return int(s)
+			}
+		}
+		return 0
+	}
+	realmOf := func(r map[string]any) string {
+		if p, ok := r["params"].(map[string]any); ok {
+			if s, ok := p["realm"].(string); ok {
+				return s
+			}
+		}
+		return ""
+	}
+	c.sess = 0
+	candidates := []string{"", "admin", "888888", "123456"}
+
+	for _, pwd := range candidates {
+		r, err := c.Call("global.login", loopParams(pwd, "Plain"), 1, nil, nil)
+		if err != nil {
+			continue
+		}
+		if ok, _ := r["result"].(bool); ok {
+			if s := sessOf(r); s != 0 {
+				c.sess = s
+				return realmOf(r), nil
+			}
+		}
+		if chSess := sessOf(r); chSess != 0 {
+			if realm := realmOf(r); realm != "" {
+				c.sess = chSess
+				for _, cpwd := range candidates {
+					r2, err2 := c.Call("global.login", loopParams(cpwd, "Plain"), 2, nil, nil)
+					if err2 != nil {
+						continue
+					}
+					if res2, _ := r2["result"].(bool); res2 {
+						if s2 := sessOf(r2); s2 != 0 {
+							c.sess = s2
+						}
+						return realm, nil
+					}
+				}
+			}
+		}
+	}
+
+	rProbe, err := c.Call("global.login", map[string]any{
+		"userName": "admin", "password": "",
+		"clientType": "Web3.0", "loginType": "Direct",
+	}, 1, nil, nil)
+	if err == nil {
+		if realm := realmOf(rProbe); realm != "" {
+			if chSess := sessOf(rProbe); chSess != 0 {
+				c.sess = chSess
+				for _, pwd := range candidates {
+					r2, err2 := c.Call("global.login", loopParams(pwd, "Plain"), 2, nil, nil)
+					if err2 != nil {
+						continue
+					}
+					if res2, _ := r2["result"].(bool); res2 {
+						if s2 := sessOf(r2); s2 != 0 {
+							c.sess = s2
+						}
+						return realm, nil
+					}
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("loopback login failed")
 }
 
 func (c *DHIPClient) ExtractCredsViaConsole() (string, string, bool) {
@@ -1638,10 +1703,22 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 				if v := xmlTag(body, "type"); v != "" {
 					m = v
 				}
+				// keep the bare value
+				if kv := parseKV(r.resp); len(kv) > 0 {
+					if v := kv["type"]; v != "" {
+						m = v
+					} else if v := kv["deviceType"]; v != "" {
+						m = v
+					}
+				}
 				model = m
 				break
 			}
 		}
+	}
+
+	if model == "" && t.user != "" {
+		model = t.deviceModelViaDHIP()
 	}
 
 	for _, path := range []string{
@@ -1685,6 +1762,52 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 
 func hasErrPrefix(s string) bool {
 	return strings.HasPrefix(s, "Error") || strings.Contains(s, "Bad Request")
+}
+
+// fetche the model over DHIP
+func (t *PTCPTunnel) deviceModelViaDHIP() string {
+	for _, port := range []int{5000, 80} {
+		dhip, err := t.NewDHIPClientOnPort(port)
+		if err != nil {
+			continue
+		}
+		if err := dhip.LoginNormal(t.user, t.pass); err != nil {
+			dhip.Close()
+			continue
+		}
+		model := dhip.DeviceModel()
+		dhip.Close()
+		if model != "" {
+			return model
+		}
+	}
+	return ""
+}
+
+// ask the session for the device type
+func (c *DHIPClient) DeviceModel() string {
+	if r, err := c.Call("magicBox.getDeviceType", nil, 5, nil, nil); err == nil {
+		if p, ok := r["params"].(map[string]any); ok {
+			if s, _ := p["type"].(string); s != "" {
+				return s
+			}
+			if s, _ := p["deviceType"].(string); s != "" {
+				return s
+			}
+		}
+	}
+	if r, err := c.Call("magicBox.getSystemInfo", nil, 6, nil, nil); err == nil {
+		if p, ok := r["params"].(map[string]any); ok {
+			if table, ok := p["table"].([]any); ok && len(table) > 0 {
+				if m, ok := table[0].(map[string]any); ok {
+					if s, _ := m["deviceType"].(string); s != "" {
+						return s
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func findHeaderEnd(data []byte) int {

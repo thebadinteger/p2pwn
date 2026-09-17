@@ -916,10 +916,6 @@ func (c *DHClient) StartHeartbeat(stop chan struct{}) {
 	}()
 }
 
-func (c *DHClient) SetTimeout(d time.Duration) {
-	c.timeout = d
-}
-
 func (c *DHClient) SetRetries(n int) {
 	c.retries = n
 }
