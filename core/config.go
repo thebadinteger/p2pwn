@@ -28,8 +28,13 @@ type Credential struct {
 	Password string `toml:"password"`
 }
 
+type BruteType1Config struct {
+	Delay interface{} `toml:"delay"`
+}
+
 type BruteConfig struct {
-	Credentials []Credential `toml:"credentials"`
+	Type1       BruteType1Config `toml:"type1"`
+	Credentials []Credential     `toml:"credentials"`
 }
 
 type DummyConfig struct {
@@ -37,41 +42,58 @@ type DummyConfig struct {
 	Password string `toml:"password"`
 }
 
+type OverlayConfig struct {
+	Osd     bool     `toml:"osd"`
+	Channel string   `toml:"channel"`
+	Custom  []string `toml:"custom"`
+}
+
 type Config struct {
-	Scan  ScanConfig  `toml:"scan"`
-	Pwn   PwnConfig   `toml:"pwn"`
-	Brute BruteConfig `toml:"brute"`
-	Dummy DummyConfig `toml:"dummy"`
-	Path  string
+	Scan    ScanConfig    `toml:"scan"`
+	Pwn     PwnConfig     `toml:"pwn"`
+	Brute   BruteConfig   `toml:"brute"`
+	Dummy   DummyConfig   `toml:"dummy"`
+	Overlay OverlayConfig `toml:"overlay"`
+	Path    string
 }
 
 const DefaultConfigData = `[scan] # Scan configuration
 timeout = 5000 # Connection timeout in milliseconds
 retries = 3 # Number of retries on connect
 generate = 1048576 # How many S/N to generate on prefix (1-1048576)
-nurses = 200 # Number of workers for checking S/N (online/offline)
+nurses = 200 # Number of workers for checking online S/N
 
 [pwn] # Usage of different protocols and methods
 snapshot = true # Take snapshots
 protocol.cgi = true # Web CGI protocol
 protocol.sdk = true # 37777 SDK protocol
-methods.brute = true # Credentials brute force
+protocol.type1 = true # Type 1 protocol
+methods.brute = true # Credentials bruteforce
 methods.cve-2021-33044 = true # CVE-2021-33044
 methods.cve-2021-33045 = true # CVE-2021-33045
 methods.cve-2024-39943 = true # CVE-2024-39943
 
-[brute] # Credentials brute force configuration
+[brute] # Bruteforce configuration
+type1.delay = 20 # Type 1 brute attempts delay in seconds
 credentials = [
   { login = "admin", password = "admin" },
+  { login = "admin", password = "admin123" },
+  { login = "admin", password = "admin12345" },
   { login = "666666", password = "666666" },
   { login = "888888", password = "888888" },
-  { login = "admin", password = "admin123" },
-  { login = "default", password = "tluafed" },
 ]
 
-[dummy] # Credentials for "dummy" account added via CVE
+[dummy] # Credentials for added dummy account
 login = "p2pwn" # 5-32 alphanumeric characters
 password = "p2password" # 8-32 alphanumeric characters
+
+[overlay] # Custom overlay configuration
+osd = true # Set OSD on pwned devices
+channel = "p2pwn" # ChannelTitle
+custom = [
+  "p2pwned",
+  "device is vulnerable"
+] # CustomTitle (up to 5 lines)
 `
 
 type Range struct {
@@ -148,30 +170,25 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 		return nil, fmt.Errorf("error in config on line %d", line)
 	}
 
-	
 	timeoutMs, err := getIntValue(conf.Scan.Timeout)
 	if err != nil || timeoutMs <= 0 {
 		return nil, fmt.Errorf("invalid timeout value in config")
 	}
 
-	
 	_, err = getIntValue(conf.Scan.Retries)
 	if err != nil {
 		return nil, fmt.Errorf("invalid retry value in config")
 	}
 
-	
 	if _, err := ParseGenerateRanges(conf.Scan.Generate); err != nil {
 		return nil, fmt.Errorf("invalid generate value in config: %s", err)
 	}
 
-	
 	nursesVal, err := getIntValue(conf.Scan.Nurses)
 	if err != nil || nursesVal <= 0 {
 		return nil, fmt.Errorf("invalid nurses value in config")
 	}
 
-	
 	hasProtocol := false
 	for _, enabled := range conf.Pwn.Protocol {
 		if enabled {
@@ -183,7 +200,6 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 		return nil, fmt.Errorf("at least one protocol must be enabled in config")
 	}
 
-	
 	hasMethod := false
 	for _, enabled := range conf.Pwn.Methods {
 		if enabled {
@@ -195,15 +211,17 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 		return nil, fmt.Errorf("at least one method must be enabled in config")
 	}
 
-	
 	alphanum := regexp.MustCompile(`^[a-zA-Z0-9]+$`)
 	if len(conf.Dummy.Login) < 5 || len(conf.Dummy.Login) > 32 || !alphanum.MatchString(conf.Dummy.Login) {
 		return nil, fmt.Errorf("invalid dummy login format in config")
 	}
 
-	
 	if len(conf.Dummy.Password) < 8 || len(conf.Dummy.Password) > 32 || !alphanum.MatchString(conf.Dummy.Password) {
 		return nil, fmt.Errorf("invalid dummy password format in config")
+	}
+
+	if len(conf.Overlay.Custom) > 5 {
+		return nil, fmt.Errorf("invalid overlay custom value in config (up to 5 lines)")
 	}
 
 	conf.Path = path

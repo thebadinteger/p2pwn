@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -14,7 +13,6 @@ type SDKClient struct {
 	tunnel *PTCPTunnel
 	user   string
 	pass   string
-	handle uint32 
 }
 
 func NewSDKClient(tunnel *PTCPTunnel, user, pass string) *SDKClient {
@@ -38,9 +36,6 @@ func (s *SDKClient) loginOnBind(realm uint32) (uint32, error) {
 		return realm, fmt.Errorf("login response too short (%d bytes)", len(resp))
 	}
 	if resp[8] == 0 {
-		if len(resp) >= 20 {
-			s.handle = binary.LittleEndian.Uint32(resp[16:20])
-		}
 		return realm, nil
 	}
 
@@ -150,9 +145,6 @@ func (s *SDKClient) loginWithHashNewRealm(challengeRealm, challengeRandom string
 	if resp[8] != 0 {
 		return realm, fmt.Errorf("hash login code %d/%d", resp[8], resp[9])
 	}
-	if len(resp) >= 20 {
-		s.handle = binary.LittleEndian.Uint32(resp[16:20])
-	}
 	return realm, nil
 }
 
@@ -237,19 +229,19 @@ func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
 	}
 
 	cmd := []byte{
-		0x11, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-		0x00, 0x00, 0x00, 0x00,                         
-		0x0a, 0x00, 0x00, 0x00,                         
-		ch,                                             
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-		0x00, 0x00, 0x00,                               
-		ch,                                             
-		0x00, 0x00, 0x00, 0x01,                         
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,       
+		0x11, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x0a, 0x00, 0x00, 0x00,
+		ch,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00,
+		ch,
+		0x00, 0x00, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	}
 
 	realm := rand.Uint32()
@@ -346,273 +338,4 @@ func stripSnapshotGarbage(data []byte, ch byte) []byte {
 		data = append(data[:idx], data[end:]...)
 	}
 	return data
-}
-
-func a1Packet() []byte {
-	pkt := make([]byte, 32)
-	pkt[0] = 0xa1
-	return pkt
-}
-
-func a4Packet(op byte) []byte {
-	pkt := make([]byte, 32)
-	pkt[0] = 0xa4
-	pkt[8] = op
-	return pkt
-}
-
-func a6MgmtPacket(op uint32, payload []byte) []byte {
-	pkt := make([]byte, 32+len(payload))
-	pkt[0] = 0xa6
-	pkt[4] = byte(len(payload))
-	binary.LittleEndian.PutUint32(pkt[8:12], op)
-	copy(pkt[32:], payload)
-	return pkt
-}
-
-func addUserPayload(index int, username, password, groupID string) []byte {
-	channels := "1,2,3"
-	return fmt.Appendf(nil, "%d:%s:%s:%s:%s::1", index, username, password, groupID, channels)
-}
-
-func groupNameToID(group string) int {
-	switch strings.ToLower(group) {
-	case "admin":
-		return 0
-	case "operator":
-		return 1
-	default:
-		return 2
-	}
-}
-
-func parseUserListResponse(resp []byte) int {
-	body := ""
-	if len(resp) > 32 {
-		body = string(resp[32:])
-	}
-	body = strings.TrimRight(body, "\x00\r\n ")
-	if body == "" {
-		return 1
-	}
-	users := strings.Split(body, "&&")
-	maxIdx := 0
-	for _, user := range users {
-		user = strings.TrimSpace(user)
-		if user == "" {
-			continue
-		}
-		parts := strings.SplitN(user, ":", 2)
-		if len(parts) >= 1 {
-			if idx, err := strconv.Atoi(parts[0]); err == nil && idx > maxIdx {
-				maxIdx = idx
-			}
-		}
-	}
-	return maxIdx + 1
-}
-
-func parseUserList(resp []byte) []map[string]string {
-	body := ""
-	if len(resp) > 32 {
-		body = string(resp[32:])
-	}
-	body = strings.TrimRight(body, "\x00\r\n ")
-	if body == "" {
-		return nil
-	}
-	var users []map[string]string
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.Split(line, ":")
-		if len(parts) < 2 {
-			continue
-		}
-		u := map[string]string{
-			"Name":  parts[1],
-			"Group": "",
-		}
-		if len(parts) >= 4 {
-			u["Group"] = parts[3]
-		}
-		users = append(users, u)
-	}
-	return users
-}
-
-func (s *SDKClient) GetUsersSDK() ([]map[string]string, error) {
-	realm := rand.Uint32()
-	if err := s.tunnel.doBindWithTarget(realm, "127.0.0.1:37777"); err != nil {
-		return nil, fmt.Errorf("bind: %w", err)
-	}
-	defer s.tunnel.DisconnectRealm(realm)
-
-	if _, err := s.loginOnBind(realm); err != nil {
-		return nil, fmt.Errorf("login: %w", err)
-	}
-
-	if err := s.userMgmtInit(realm); err != nil {
-		return nil, fmt.Errorf("init: %w", err)
-	}
-
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(5, nil), realm); err != nil {
-		return nil, fmt.Errorf("groups send: %w", err)
-	}
-	if _, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second); err != nil {
-		return nil, fmt.Errorf("groups resp: %w", err)
-	}
-
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(9, nil), realm); err != nil {
-		return nil, fmt.Errorf("users send: %w", err)
-	}
-	usersResp, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("users resp: %w", err)
-	}
-
-	return parseUserList(usersResp), nil
-}
-
-func (s *SDKClient) userMgmtInit(realm uint32) error {
-	for i := 0; i < 2; i++ {
-		if err := s.tunnel.SendDataWithRealm(a1Packet(), realm); err != nil {
-			return fmt.Errorf("a1[%d]: %w", i, err)
-		}
-		if _, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second); err != nil {
-			return fmt.Errorf("a1[%d]resp: %w", i, err)
-		}
-	}
-
-	for i := 0; i < 2; i++ {
-		for _, op := range []byte{0x1a, 0x08} {
-			if err := s.tunnel.SendDataWithRealm(a4Packet(op), realm); err != nil {
-				return fmt.Errorf("a4 0x%02x[%d]: %w", op, i, err)
-			}
-			if _, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second); err != nil {
-				return fmt.Errorf("a4 0x%02x[%d]resp: %w", op, i, err)
-			}
-		}
-	}
-
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(1, nil), realm); err != nil {
-		return fmt.Errorf("a6 init: %w", err)
-	}
-	_, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("a6 init resp: %w", err)
-	}
-	return nil
-}
-
-func (s *SDKClient) AddUserSDK(username, password, groupID string) error {
-	realm := rand.Uint32()
-	if err := s.tunnel.doBindWithTarget(realm, "127.0.0.1:37777"); err != nil {
-		return fmt.Errorf("bind: %w", err)
-	}
-	defer s.tunnel.DisconnectRealm(realm)
-
-	if _, err := s.loginOnBind(realm); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
-
-	if err := s.userMgmtInit(realm); err != nil {
-		return fmt.Errorf("init: %w", err)
-	}
-
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(5, nil), realm); err != nil {
-		return fmt.Errorf("groups send: %w", err)
-	}
-	if _, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second); err != nil {
-		return fmt.Errorf("groups resp: %w", err)
-	}
-
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(9, nil), realm); err != nil {
-		return fmt.Errorf("users send: %w", err)
-	}
-	usersResp, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("users resp: %w", err)
-	}
-	nextIdx := parseUserListResponse(usersResp)
-
-	payload := addUserPayload(nextIdx, username, password, fmt.Sprintf("%d", groupNameToID(groupID)))
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(6, payload), realm); err != nil {
-		return fmt.Errorf("add send: %w", err)
-	}
-	addResp, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("add resp: %w", err)
-	}
-	if len(addResp) == 0 || addResp[0] != 0xb6 {
-		return fmt.Errorf("add user failed: resp op=0x%02x", addResp[0])
-	}
-	return nil
-}
-
-func (s *SDKClient) DeleteUserSDK(username string) error {
-	realm := rand.Uint32()
-	if err := s.tunnel.doBindWithTarget(realm, "127.0.0.1:37777"); err != nil {
-		return fmt.Errorf("bind: %w", err)
-	}
-	defer s.tunnel.DisconnectRealm(realm)
-
-	if _, err := s.loginOnBind(realm); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
-
-	if err := s.userMgmtInit(realm); err != nil {
-		return fmt.Errorf("init: %w", err)
-	}
-
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(5, nil), realm); err != nil {
-		return fmt.Errorf("groups send: %w", err)
-	}
-	if _, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second); err != nil {
-		return fmt.Errorf("groups resp: %w", err)
-	}
-
-	payload := []byte(username)
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(7, payload), realm); err != nil {
-		return fmt.Errorf("del send: %w", err)
-	}
-	delResp, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("del resp: %w", err)
-	}
-	if len(delResp) == 0 || delResp[0] != 0xb6 {
-		return fmt.Errorf("delete user failed: resp op=0x%02x", delResp[0])
-	}
-	return nil
-}
-
-func (s *SDKClient) ModifyPasswordSDK(username, newPassword string) error {
-	realm := rand.Uint32()
-	if err := s.tunnel.doBindWithTarget(realm, "127.0.0.1:37777"); err != nil {
-		return fmt.Errorf("bind: %w", err)
-	}
-	defer s.tunnel.DisconnectRealm(realm)
-
-	if _, err := s.loginOnBind(realm); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
-
-	if err := s.userMgmtInit(realm); err != nil {
-		return fmt.Errorf("init: %w", err)
-	}
-
-	payload := fmt.Appendf(nil, "%s:Intel:%s:%s", username, newPassword, newPassword)
-	if err := s.tunnel.SendDataWithRealm(a6MgmtPacket(0x0a, payload), realm); err != nil {
-		return fmt.Errorf("modpass send: %w", err)
-	}
-	resp, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("modpass resp: %w", err)
-	}
-	if len(resp) == 0 || resp[0] != 0xb6 {
-		return fmt.Errorf("modify password failed: resp op=0x%02x", resp[0])
-	}
-	return nil
 }

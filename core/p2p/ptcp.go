@@ -3,6 +3,7 @@ package p2p
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 )
 
 const PTCPMagic = "PTCP"
@@ -45,6 +46,7 @@ func ParsePTCPPacket(data []byte) (*PTCPPacket, error) {
 }
 
 type PTCPSession struct {
+	mu    sync.Mutex
 	Sent  uint32
 	Recv  uint32
 	Count uint32
@@ -57,6 +59,8 @@ func NewPTCPSession() *PTCPSession {
 }
 
 func (s *PTCPSession) Send(body []byte) *PTCPPacket {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	pid := uint32(0x0002FFFF)
 	if !isSYNBody(body) {
 		pid = 0x0000FFFF - s.Count
@@ -78,6 +82,8 @@ func (s *PTCPSession) Send(body []byte) *PTCPPacket {
 }
 
 func (s *PTCPSession) Receive(p *PTCPPacket) *PTCPPacket {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if p.Sent+uint32(len(p.Body)) > s.Recv {
 		s.Recv = p.Sent + uint32(len(p.Body))
 	}
@@ -139,26 +145,4 @@ func ParsePayloadBody(body []byte) (realm uint32, payload []byte, err error) {
 		return 0, nil, fmt.Errorf("payload length mismatch: expected %d, got %d", actualLen, len(payload))
 	}
 	return realm, payload, nil
-}
-
-func MakeBindBody(realm, port uint32) []byte {
-	data := make([]byte, 8)
-	data[0] = 0x11
-	data[1] = 0x00
-	data[2] = 0x00
-	data[3] = 0x00
-	binary.BigEndian.PutUint32(data[4:8], realm)
-	data = append(data, []byte{0x00, 0x00, 0x00, 0x00}...)
-	portBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(portBytes, port)
-	data = append(data, portBytes...)
-	data = append(data, []byte{0x7f, 0x00, 0x00, 0x01}...)
-	return data
-}
-
-func SignFromBody(body []byte) []byte {
-	if len(body) > 12 {
-		return body[12:]
-	}
-	return nil
 }

