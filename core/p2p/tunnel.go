@@ -770,12 +770,18 @@ func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 	return pkt, nil
 }
 
+const sweepCallTimeout = 5 * time.Second
+
 func (c *DHIPClient) Call(method string, params any, id int, object any, notifies *[]map[string]any) (map[string]any, error) {
+	return c.CallT(method, params, id, object, notifies, 15*time.Second)
+}
+
+func (c *DHIPClient) CallT(method string, params any, id int, object any, notifies *[]map[string]any, timeout time.Duration) (map[string]any, error) {
 	if err := c.send(method, params, id, object); err != nil {
 		return nil, err
 	}
 	for {
-		pkt, err := c.readPacket(15 * time.Second)
+		pkt, err := c.readPacket(timeout)
 		if err != nil {
 			return nil, err
 		}
@@ -930,7 +936,7 @@ func (c *DHIPClient) LoginLoopback() error {
 	}
 
 	for _, pwd := range []string{"admin", ""} {
-		r3, err := c.Call("global.login", map[string]any{
+		r3, err := c.CallT("global.login", map[string]any{
 			"userName":      "admin",
 			"password":      pwd,
 			"clientType":    "Local",
@@ -938,7 +944,7 @@ func (c *DHIPClient) LoginLoopback() error {
 			"ipAddr":        "127.0.0.1",
 			"passwordType":  "Plain",
 			"authorityType": "Default",
-		}, 1, nil, nil)
+		}, 1, nil, nil, sweepCallTimeout)
 		if err != nil {
 			continue
 		}
@@ -951,7 +957,7 @@ func (c *DHIPClient) LoginLoopback() error {
 	for _, pwd := range []string{"admin", ""} {
 		h1 := strings.ToUpper(md5Hex(fmt.Sprintf("admin:%s:%s", realm, pwd)))
 		h2 := strings.ToUpper(md5Hex(fmt.Sprintf("admin:%s:%s", random, h1)))
-		r4, err := c.Call("global.login", map[string]any{
+		r4, err := c.CallT("global.login", map[string]any{
 			"userName":      "admin",
 			"password":      h2,
 			"clientType":    "Local",
@@ -959,7 +965,7 @@ func (c *DHIPClient) LoginLoopback() error {
 			"ipAddr":        "127.0.0.1",
 			"passwordType":  "Default",
 			"authorityType": "Default",
-		}, 1, nil, nil)
+		}, 1, nil, nil, sweepCallTimeout)
 		if err != nil {
 			continue
 		}
@@ -1003,7 +1009,7 @@ func (c *DHIPClient) LoginLoopbackRealm() (string, error) {
 	candidates := []string{"", "admin", "888888", "123456"}
 
 	for _, pwd := range candidates {
-		r, err := c.Call("global.login", loopParams(pwd, "Plain"), 1, nil, nil)
+		r, err := c.CallT("global.login", loopParams(pwd, "Plain"), 1, nil, nil, sweepCallTimeout)
 		if err != nil {
 			continue
 		}
@@ -1017,7 +1023,7 @@ func (c *DHIPClient) LoginLoopbackRealm() (string, error) {
 			if realm := realmOf(r); realm != "" {
 				c.sess = chSess
 				for _, cpwd := range candidates {
-					r2, err2 := c.Call("global.login", loopParams(cpwd, "Plain"), 2, nil, nil)
+					r2, err2 := c.CallT("global.login", loopParams(cpwd, "Plain"), 2, nil, nil, sweepCallTimeout)
 					if err2 != nil {
 						continue
 					}
@@ -1032,16 +1038,16 @@ func (c *DHIPClient) LoginLoopbackRealm() (string, error) {
 		}
 	}
 
-	rProbe, err := c.Call("global.login", map[string]any{
+	rProbe, err := c.CallT("global.login", map[string]any{
 		"userName": "admin", "password": "",
 		"clientType": "Web3.0", "loginType": "Direct",
-	}, 1, nil, nil)
+	}, 1, nil, nil, sweepCallTimeout)
 	if err == nil {
 		if realm := realmOf(rProbe); realm != "" {
 			if chSess := sessOf(rProbe); chSess != 0 {
 				c.sess = chSess
 				for _, pwd := range candidates {
-					r2, err2 := c.Call("global.login", loopParams(pwd, "Plain"), 2, nil, nil)
+					r2, err2 := c.CallT("global.login", loopParams(pwd, "Plain"), 2, nil, nil, sweepCallTimeout)
 					if err2 != nil {
 						continue
 					}
@@ -1764,9 +1770,9 @@ func hasErrPrefix(s string) bool {
 	return strings.HasPrefix(s, "Error") || strings.Contains(s, "Bad Request")
 }
 
-// fetche the model over DHIP
+// fetch the model over DHIP
 func (t *PTCPTunnel) deviceModelViaDHIP() string {
-	for _, port := range []int{5000, 80} {
+	for _, port := range []int{80, 5000} {
 		dhip, err := t.NewDHIPClientOnPort(port)
 		if err != nil {
 			continue
