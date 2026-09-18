@@ -961,9 +961,11 @@ func resolveCached(hostport string) (*net.UDPAddr, error) {
 	if err != nil {
 		return net.ResolveUDPAddr("udp", hostport)
 	}
-	ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), host)
+	dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dnsCancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(dnsCtx, host)
 	if err != nil || len(ips) == 0 {
-		return net.ResolveUDPAddr("udp", hostport)
+		return nil, fmt.Errorf("dns lookup %s: %w", host, err)
 	}
 	addrs := make([]*net.UDPAddr, 0, len(ips))
 	for _, ip := range ips {
@@ -973,7 +975,7 @@ func resolveCached(hostport string) (*net.UDPAddr, error) {
 		addrs = append(addrs, &net.UDPAddr{IP: ip.IP, Port: port})
 	}
 	if len(addrs) == 0 {
-		return net.ResolveUDPAddr("udp", hostport)
+		return nil, fmt.Errorf("dns lookup %s: no addresses", host)
 	}
 	p := &dnsPool{addrs: addrs, expires: time.Now().Add(dnsPoolTTL)}
 	dnsPools.Store(hostport, p)

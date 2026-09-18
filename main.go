@@ -158,6 +158,17 @@ func main() {
 		printErrorAndExit("Empty input")
 	}
 
+	seen := make(map[string]struct{}, len(targets))
+	uniq := make([]string, 0, len(targets))
+	for _, t := range targets {
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		uniq = append(uniq, t)
+	}
+	targets = uniq
+
 	// Determine output dir
 	if output == "" {
 		output = time.Now().Format("02-01-2006_15-04-05")
