@@ -493,7 +493,7 @@ func applySingleShot(label string, newSess func() (*osdSession, error), channel 
 	if len(ctOut) == 0 && len(vwOut) == 0 {
 		return fmt.Errorf("%s: nothing to set", label)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(100 * time.Millisecond)
 	setErr := s.setBoth(ctOut, vwOut)
 	if setErr == nil {
 		return nil // device acknowledged per-call result:true

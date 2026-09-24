@@ -40,6 +40,7 @@ func printHelp() {
 	fmt.Printf("Default > 100\n")
 	fmt.Printf("[-c, --config] Path to config file\n")
 	fmt.Printf("Default > config.toml\n")
+	fmt.Printf("[-d, --debug] Log everything\n")
 	fmt.Printf("[-?, -h, --help] Get general help\n")
 	enc := []byte{0xF0, 0xEC, 0xFB, 0xE7, 0xDD, 0x98, 0xF6, 0x8B, 0xCC, 0xC2, 0xDF, 0xC3, 0xDE, 0xC9, 0x85, 0xC8, 0xC4, 0xC6, 0x84, 0xDF, 0xC3, 0xCE, 0xC9, 0xCA, 0xCF, 0xC2, 0xC5, 0xDF, 0xCE, 0xCC, 0xCE, 0xD9}
 	colHiWhite.Printf("%s\n", xorDecode(enc, 0xAB))
@@ -77,6 +78,7 @@ func main() {
 	var output string
 	threads := 100
 	configPath := "config.toml"
+	debugEnabled := false
 	showHelp := false
 
 	for i := 0; i < len(args); i++ {
@@ -102,6 +104,8 @@ func main() {
 				configPath = args[i+1]
 				i++
 			}
+		case "-d", "--debug":
+			debugEnabled = true
 		case "-h", "-?", "--help":
 			showHelp = true
 		}
@@ -184,6 +188,12 @@ func main() {
 	if err != nil {
 		printErrorAndExit(err.Error())
 	}
+
+	// Init debug logger if enabled
+	if err := core.InitDebug(output, debugEnabled); err != nil {
+		printErrorAndExit(err.Error())
+	}
+	defer core.CloseDebug()
 
 	// Run scanner
 	scanner := core.NewScanner(targets, cfg, threads, output, inputSource)

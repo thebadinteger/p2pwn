@@ -187,6 +187,7 @@ func (c *DHClient) doExchange(conn *net.UDPConn, addr, method, path, body string
 			acseq = prof.nextCSeq()
 		}
 		req := prof.buildRequest(method, path, body, auth, acseq)
+		LogDebugf("udp", "exchange %s %s > %s (attempt %d/%d)", method, path, addr, attempt+1, maxAttempts)
 		if err := c.sendTo(conn, addr, req); err != nil {
 			return nil, err
 		}
@@ -198,6 +199,7 @@ func (c *DHClient) doExchange(conn *net.UDPConn, addr, method, path, body string
 		}
 		lastErr = err
 	}
+	LogDebugf("udp", "exchange %s %s > failed after %d attempts: %v", method, path, maxAttempts, lastErr)
 	return nil, fmt.Errorf("recvResend: no response after %d attempts (timeout=%v): %v", maxAttempts, timeout, lastErr)
 }
 
@@ -321,8 +323,8 @@ func (c *DHClient) Handshake() error {
 	}
 
 	timeout := c.timeout
-	if timeout == 0 {
-		timeout = 2 * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Second
 	}
 	maxAttempts := c.retries
 	if maxAttempts < 1 {
@@ -427,7 +429,11 @@ func (c *DHClient) Handshake() error {
 		return fmt.Errorf("p2p-channel send: %w", err)
 	}
 
-	token, err := c.fetchRelayAgent(prof, 4*time.Second)
+	relayTimeout := timeout
+	if relayTimeout < 4*time.Second {
+		relayTimeout = 4 * time.Second
+	}
+	token, err := c.fetchRelayAgent(prof, relayTimeout)
 	if err != nil {
 		return err
 	}
@@ -498,7 +504,11 @@ func (c *DHClient) Handshake() error {
 		relayAuthStr = GetP2PAuth(c.deviceUser, chanKey, relayNonce, "", c.randsalt)
 	}
 	relayChBody := fmt.Sprintf("<body>%s<agentAddr>%s</agentAddr></body>", relayAuthStr, c.agentAddr)
-	_ = c.waitRelayChannelAck(prof, relayChBody, 2*time.Second, maxAttempts)
+	ackTimeout := c.timeout
+	if ackTimeout <= 0 {
+		ackTimeout = 2 * time.Second
+	}
+	_ = c.waitRelayChannelAck(prof, relayChBody, ackTimeout, maxAttempts)
 
 	if c.dtype == 0 {
 		if err := c.PTCPHandshake(); err != nil {
@@ -916,6 +926,10 @@ func (c *DHClient) StartHeartbeat(stop chan struct{}) {
 	}()
 }
 
+func (c *DHClient) SetTimeout(d time.Duration) {
+	c.timeout = d
+}
+
 func (c *DHClient) SetRetries(n int) {
 	c.retries = n
 }
@@ -935,6 +949,7 @@ func (c *DHClient) GetDeviceAddr() string {
 
 var (
 	dnsPools   sync.Map
+	dnsMu      sync.Mutex
 	dnsPoolTTL = 5 * time.Minute
 )
 
@@ -949,7 +964,7 @@ func parseUDPAddr(addr string) *net.UDPAddr {
 func resolveCached(hostport string) (*net.UDPAddr, error) {
 	host, portStr, err := net.SplitHostPort(hostport)
 	if err != nil || net.ParseIP(host) != nil {
-		return net.ResolveUDPAddr("udp", hostport)
+		return net.ResolveUDPAddr("udp4", hostport)
 	}
 	if v, ok := dnsPools.Load(hostport); ok {
 		if p := v.(*dnsPool); time.Now().Before(p.expires) && len(p.addrs) > 0 {
@@ -957,9 +972,18 @@ func resolveCached(hostport string) (*net.UDPAddr, error) {
 			return p.addrs[int(i)%len(p.addrs)], nil
 		}
 	}
-	port, err := net.LookupPort("udp", portStr)
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+	if v, ok := dnsPools.Load(hostport); ok {
+		if p := v.(*dnsPool); time.Now().Before(p.expires) && len(p.addrs) > 0 {
+			i := p.next.Add(1)
+			return p.addrs[int(i)%len(p.addrs)], nil
+		}
+	}
+
+	port, err := net.LookupPort("udp4", portStr)
 	if err != nil {
-		return net.ResolveUDPAddr("udp", hostport)
+		return net.ResolveUDPAddr("udp4", hostport)
 	}
 	dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer dnsCancel()
@@ -972,7 +996,9 @@ func resolveCached(hostport string) (*net.UDPAddr, error) {
 		if ip.IP == nil {
 			continue
 		}
-		addrs = append(addrs, &net.UDPAddr{IP: ip.IP, Port: port})
+		if ip4 := ip.IP.To4(); ip4 != nil {
+			addrs = append(addrs, &net.UDPAddr{IP: ip4, Port: port})
+		}
 	}
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("dns lookup %s: no addresses", host)
@@ -989,72 +1015,86 @@ type dnsPool struct {
 	expires time.Time
 }
 
-// does serial resolves on the cloud and answers the probe
-func CheckOnline(serial string) bool {
-	return checkOnlineWith(serial, 2*time.Second, 2)
+// pooled UDP sockets for online checks
+var udpCheckPool = sync.Pool{
+	New: func() any {
+		c, err := net.ListenUDP("udp4", nil)
+		if err != nil {
+			return err // sentinel: no socket available this time
+		}
+		return c
+	},
 }
 
-func checkOnlineWith(serial string, timeout time.Duration, retries int) bool {
+func getCheckConn() *net.UDPConn {
+	v := udpCheckPool.Get()
+	if _, ok := v.(error); ok {
+		return nil
+	}
+	conn, _ := v.(*net.UDPConn)
+	return conn
+}
+
+// remove packets queued on a pooled socket
+func drainUDP(conn *net.UDPConn, buf []byte) {
+	conn.SetReadDeadline(time.Now())
+	for {
+		if _, _, err := conn.ReadFrom(buf); err != nil {
+			return
+		}
+	}
+}
+
+func udpCheckExchange(conn *net.UDPConn, raddr *net.UDPAddr, req []byte, cseq string, timeout time.Duration, attempts int, buf []byte) (*DHResponse, bool) {
+	for i := 0; i < attempts; i++ {
+		drainUDP(conn, buf)
+		if _, err := conn.WriteTo(req, raddr); err != nil {
+			continue
+		}
+		deadline := time.Now().Add(timeout)
+		for {
+			conn.SetReadDeadline(deadline)
+			n, _, err := conn.ReadFrom(buf)
+			if err != nil {
+				break
+			}
+			resp, pErr := parseDHResponse(buf[:n])
+			if pErr != nil {
+				continue
+			}
+			if resp.Headers["CSeq"] == cseq || resp.Headers["CSeq"] == "" {
+				return resp, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func CheckOnlineWith(serial string, timeout time.Duration, retries int) bool {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	if retries < 1 {
+		retries = 1
+	}
 	prof := SmartPSSProfile
 
-	buildReq := func(body, path string) string {
-		return string(prof.buildRequest(prof.verbFor(body), path, body, true, prof.nextCSeq()))
-	}
-
-	mainConn, err := net.ListenUDP("udp", nil)
-	if err != nil {
+	conn := getCheckConn()
+	if conn == nil {
 		return false
 	}
-	defer mainConn.Close()
+	defer udpCheckPool.Put(conn)
+	buf := make([]byte, 4096)
 
-	sendRecv := func(conn *net.UDPConn, addr string, reqData string, maxAttempts int) ([]byte, bool) {
-		buf := make([]byte, 4096)
-		udpAddr, err := resolveCached(addr)
-		if err != nil || udpAddr == nil {
-			return nil, false
-		}
-		for i := 0; i < maxAttempts; i++ {
-			conn.WriteTo([]byte(reqData), udpAddr)
-			conn.SetReadDeadline(time.Now().Add(timeout))
-			n, _, err := conn.ReadFrom(buf)
-			if err == nil {
-				return buf[:n], true
-			}
-		}
-		return nil, false
-	}
-
-	sendRecvConn := func(addr, reqData string, maxAttempts int) ([]byte, bool) {
-		udpAddr, err := resolveCached(addr)
-		if err != nil || udpAddr == nil {
-			return nil, false
-		}
-		conn, err := net.DialUDP("udp", nil, udpAddr)
-		if err != nil {
-			return nil, false
-		}
-		defer conn.Close()
-		buf := make([]byte, 4096)
-		for i := 0; i < maxAttempts; i++ {
-			conn.Write([]byte(reqData))
-			conn.SetReadDeadline(time.Now().Add(timeout))
-			n, err := conn.Read(buf)
-			if err == nil {
-				return buf[:n], true
-			}
-		}
-		return nil, false
-	}
-
-	// no warmup probe here
-	req1 := buildReq("", "/online/p2psrv/"+serial)
-	respData, ok := sendRecv(mainConn, prof.MainServer, req1, retries)
-	if !ok {
+	raddr, err := resolveCached(prof.MainServer)
+	if err != nil || raddr == nil {
 		return false
 	}
 
-	resp, err := parseDHResponse(respData)
-	if err != nil || resp.Code >= 300 {
+	cseq1 := prof.nextCSeq()
+	req1 := prof.buildRequest(prof.verbFor(""), "/online/p2psrv/"+serial, "", true, cseq1)
+	resp, ok := udpCheckExchange(conn, raddr, req1, strconv.FormatUint(uint64(cseq1), 10), timeout, retries, buf)
+	if !ok || resp.Code >= 300 {
 		return false
 	}
 	p2pAddr := resp.XMLBody["body/US"]
@@ -1062,16 +1102,16 @@ func checkOnlineWith(serial string, timeout time.Duration, retries int) bool {
 		return false
 	}
 
-	req2 := buildReq("", "/probe/device/"+serial)
-	respData, ok = sendRecvConn(p2pAddr, req2, retries)
-	if !ok {
+	relayAddr, err := resolveCached(p2pAddr)
+	if err != nil || relayAddr == nil {
+		return false
+	}
+	cseq2 := prof.nextCSeq()
+	req2 := prof.buildRequest(prof.verbFor(""), "/probe/device/"+serial, "", true, cseq2)
+	resp2, ok2 := udpCheckExchange(conn, relayAddr, req2, strconv.FormatUint(uint64(cseq2), 10), timeout, retries, buf)
+	if !ok2 {
 		return false
 	}
 
-	resp, err = parseDHResponse(respData)
-	if err != nil {
-		return false
-	}
-
-	return resp.Code == 200
+	return resp2.Code == 200
 }

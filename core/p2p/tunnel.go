@@ -13,7 +13,6 @@ import (
 	"io"
 	"math/rand"
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -128,10 +127,6 @@ func (t *PTCPTunnel) SendDataWithRealm(data []byte, realm uint32) error {
 	return nil
 }
 
-func (t *PTCPTunnel) SendData(data []byte) error {
-	return t.SendDataWithRealm(data, t.realm)
-}
-
 func (t *PTCPTunnel) ReadData(timeout time.Duration) ([]byte, error) {
 	conn := t.conn
 	var out []byte
@@ -143,9 +138,12 @@ func (t *PTCPTunnel) ReadData(timeout time.Duration) ([]byte, error) {
 
 	conn.SetReadBuffer(512 * 1024)
 
+	deadline := time.Now().Add(timeout)
+	resultDeadline := deadline
+
 	buf := make([]byte, 65536)
-	for {
-		conn.SetReadDeadline(time.Now().Add(timeout))
+	for time.Now().Before(resultDeadline) {
+		conn.SetReadDeadline(resultDeadline)
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			if len(out) > 0 {
@@ -206,7 +204,10 @@ func (t *PTCPTunnel) ReadData(timeout time.Duration) ([]byte, error) {
 			}
 			t.sendACK()
 			out = append(out, payload...)
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			newDeadline := time.Now().Add(100 * time.Millisecond)
+			if newDeadline.Before(resultDeadline) {
+				resultDeadline = newDeadline
+			}
 			continue
 		}
 
@@ -214,6 +215,11 @@ func (t *PTCPTunnel) ReadData(timeout time.Duration) ([]byte, error) {
 			t.sendACK()
 		}
 	}
+
+	if len(out) > 0 {
+		return out, nil
+	}
+	return nil, fmt.Errorf("read tunnel: timeout")
 }
 
 func (t *PTCPTunnel) sendACK() {
@@ -780,8 +786,13 @@ func (c *DHIPClient) CallT(method string, params any, id int, object any, notifi
 	if err := c.send(method, params, id, object); err != nil {
 		return nil, err
 	}
+	deadline := time.Now().Add(timeout)
 	for {
-		pkt, err := c.readPacket(timeout)
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			return nil, fmt.Errorf("dhip call timeout for %s", method)
+		}
+		pkt, err := c.readPacket(rem)
 		if err != nil {
 			return nil, err
 		}
@@ -1213,53 +1224,12 @@ func dhipSessInt(v any) int {
 }
 
 func (t *PTCPTunnel) doHTTP(req []byte, timeout time.Duration) ([]byte, error) {
-	t.DisconnectRealm(t.realm)
-	t.realm = rand.Uint32()
-	if err := t.doBind(t.realm); err != nil {
+	realm := rand.Uint32()
+	if err := t.doBind(realm); err != nil {
 		return nil, fmt.Errorf("bind: %w", err)
 	}
-
-	if err := t.SendData(req); err != nil {
-		return nil, fmt.Errorf("send http: %w", err)
-	}
-
-	var fullResp []byte
-
-	for {
-		data, err := t.ReadData(timeout)
-		if err != nil {
-			if len(fullResp) > 0 {
-				return fullResp, nil
-			}
-			return nil, fmt.Errorf("read http: %w", err)
-		}
-		fullResp = append(fullResp, data...)
-
-		headerEnd := findHeaderEnd(fullResp)
-		if headerEnd < 0 {
-			continue
-		}
-
-		bodyLen := len(fullResp) - headerEnd
-
-		cl := parseContentLength(string(fullResp[:headerEnd]))
-		if cl > 0 {
-			if bodyLen >= cl {
-				return fullResp, nil
-			}
-			continue
-		}
-
-		body := fullResp[headerEnd:]
-		if contains(fullResp[:headerEnd], "transfer-encoding: chunked") || bytes.HasSuffix(body, []byte("0\r\n\r\n")) {
-			if bytes.HasSuffix(body, []byte("0\r\n\r\n")) {
-				return fullResp, nil
-			}
-			continue
-		}
-
-		return fullResp, nil
-	}
+	defer t.DisconnectRealm(realm)
+	return t.DoHTTPOnRealm(realm, req, timeout)
 }
 
 func (t *PTCPTunnel) doBind(realm uint32) error {
@@ -1498,21 +1468,11 @@ func insertAuthHeader(req, authHeader string) string {
 	return strings.Join(result, "\r\n")
 }
 
-func (t *PTCPTunnel) Snapshot(channel int) ([]byte, error) {
-	ch := channel
-	if ch <= 0 {
-		ch = 1
-	}
-
+func (t *PTCPTunnel) Snapshot() ([]byte, error) {
 	urls := []string{
-		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d", ch),
-		fmt.Sprintf("/cgi-bin/snapshot.cgi?chn=%d", ch),
-		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d", ch-1),
-		fmt.Sprintf("/cgi-bin/snapshot.cgi?chn=%d", ch-1),
-		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d", 0),
-		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d&loginuse=%s&loginpas=%s", ch, url.QueryEscape(t.user), url.QueryEscape(t.pass)),
-		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d&loginuse=%s&loginpas=%s", ch-1, url.QueryEscape(t.user), url.QueryEscape(t.pass)),
-		fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d&loginuse=%s&loginpas=%s", 0, url.QueryEscape(t.user), url.QueryEscape(t.pass)),
+		"/cgi-bin/snapshot.cgi?action=snapshot&channel=1",
+		"/cgi-bin/snapshot.cgi",
+		"/cgi-bin/jpeg.cgi?channel=1",
 	}
 
 	for _, u := range urls {
@@ -1541,26 +1501,24 @@ func ExtractJPEG(resp []byte) ([]byte, bool) {
 		body = DechunkHTTP(body)
 	}
 
-	soi := bytes.Index(body, []byte{0xFF, 0xD8})
-	if soi < 0 {
-		return nil, false
-	}
-	jpeg := body[soi:]
 	off := 0
-	for tries := 0; tries < 8; tries++ {
-		rel := bytes.Index(jpeg[off:], []byte{0xFF, 0xD9})
+	for off+1 < len(body) {
+		rel := bytes.Index(body[off:], []byte{0xFF, 0xD8})
 		if rel < 0 {
 			break
 		}
-		candidate := jpeg[:off+rel+2]
-		if len(candidate) >= 1000 && decodableJPEG(candidate) {
-			return candidate, true
-		}
-		off += rel + 2
-		if off >= len(jpeg) {
+		soi := off + rel
+		eoiRel := bytes.Index(body[soi+2:], []byte{0xFF, 0xD9})
+		if eoiRel < 0 {
 			break
 		}
+		candidate := body[soi : soi+2+eoiRel+2]
+		if len(candidate) >= 1000 && (decodableJPEG(candidate) || StructurallyValidJPEG(candidate)) {
+			return candidate, true
+		}
+		off = soi + 2
 	}
+
 	return nil, false
 }
 
@@ -1568,6 +1526,79 @@ func ExtractJPEG(resp []byte) ([]byte, bool) {
 func decodableJPEG(bs []byte) bool {
 	_, err := jpeg.Decode(bytes.NewReader(bs))
 	return err == nil
+}
+
+func isSOFMarker(m byte) bool {
+	switch m {
+	case 0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF:
+		return true
+	}
+	return false
+}
+
+func StructurallyValidJPEG(data []byte) bool {
+	if len(data) < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+		return false
+	}
+	i := 2
+	sawSOF, sawSOS := false, false
+	for i < len(data) {
+		if data[i] != 0xFF {
+			return false
+		}
+		for i < len(data) && data[i] == 0xFF {
+			i++
+		}
+		if i >= len(data) {
+			return false
+		}
+		m := data[i]
+		i++
+		switch {
+		case m == 0xD9: // EOI
+			return sawSOF && sawSOS
+		case m == 0xD8: // nested SOI
+			return false
+		case m == 0x01 || (m >= 0xD0 && m <= 0xD7): // standalone markers
+			continue
+		case m == 0xDA:
+			if i+2 > len(data) {
+				return false
+			}
+			segLen := int(data[i])<<8 | int(data[i+1])
+			if segLen < 2 || i+segLen > len(data) {
+				return false
+			}
+			sawSOS = true
+			i += segLen
+			// skip entropy-coded data until the next real marker
+			for i+1 < len(data) {
+				if data[i] != 0xFF {
+					i++
+					continue
+				}
+				nxt := data[i+1]
+				if nxt == 0x00 || (nxt >= 0xD0 && nxt <= 0xD7) {
+					i += 2
+					continue
+				}
+				break
+			}
+		default: // segment with a two-byte length
+			if i+2 > len(data) {
+				return false
+			}
+			segLen := int(data[i])<<8 | int(data[i+1])
+			if segLen < 2 || i+segLen > len(data) {
+				return false
+			}
+			if isSOFMarker(m) {
+				sawSOF = true
+			}
+			i += segLen
+		}
+	}
+	return false
 }
 
 func DechunkHTTP(data []byte) []byte {

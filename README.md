@@ -56,6 +56,7 @@ If doesn't exist, will be created
 Default > 100
 [-c, --config] Path to config file
 Default > config.toml
+[-d, --debug] Log everything
 [-?, -h, --help] Get general help
 ```  
 
