@@ -1068,8 +1068,6 @@ func (c *DHIPClient) LoginLoopbackRealm() (string, error) {
 	return "", fmt.Errorf("loopback login failed")
 }
 
-// drainNotifies collects notify packets that keep arriving after a call,
-// waiting up to idleTimeout of silence and maxTotal overall
 func (c *DHIPClient) drainNotifies(idleTimeout, maxTotal time.Duration) []map[string]any {
 	var out []map[string]any
 	deadline := time.Now().Add(maxTotal)

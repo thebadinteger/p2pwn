@@ -1035,20 +1035,27 @@ func getCheckConn() *net.UDPConn {
 	return conn
 }
 
-// remove packets queued on a pooled socket
-func drainUDP(conn *net.UDPConn, buf []byte) {
+// remove packets queued on a pooled socket, returns how many were dropped
+func drainUDP(conn *net.UDPConn, buf []byte) int {
+	dropped := 0
 	conn.SetReadDeadline(time.Now())
 	for {
 		if _, _, err := conn.ReadFrom(buf); err != nil {
-			return
+			return dropped
 		}
+		dropped++
 	}
 }
 
 func udpCheckExchange(conn *net.UDPConn, raddr *net.UDPAddr, req []byte, cseq string, timeout time.Duration, attempts int, buf []byte) (*DHResponse, bool) {
+	rs := paceRelay(raddr)
 	for i := 0; i < attempts; i++ {
-		drainUDP(conn, buf)
+		if n := drainUDP(conn, buf); n > 0 {
+			atomic.AddInt64(&globalCheckPacer.drained, int64(n))
+		}
+		t0 := time.Now()
 		if _, err := conn.WriteTo(req, raddr); err != nil {
+			atomic.AddInt64(&globalCheckPacer.writeEr, 1)
 			continue
 		}
 		deadline := time.Now().Add(timeout)
@@ -1060,13 +1067,22 @@ func udpCheckExchange(conn *net.UDPConn, raddr *net.UDPAddr, req []byte, cseq st
 			}
 			resp, pErr := parseDHResponse(buf[:n])
 			if pErr != nil {
+				atomic.AddInt64(&rs.skip, 1)
 				continue
 			}
 			if resp.Headers["CSeq"] == cseq || resp.Headers["CSeq"] == "" {
+				atomic.AddInt64(&rs.ok, 1)
+				if i < 3 {
+					atomic.AddInt64(&globalCheckPacer.attOk[i], 1)
+				}
+				PaceReport(true, time.Since(t0))
 				return resp, true
 			}
+			atomic.AddInt64(&rs.skip, 1)
 		}
 	}
+	atomic.AddInt64(&rs.to, 1)
+	PaceReport(false, 0)
 	return nil, false
 }
 
@@ -1077,6 +1093,9 @@ func CheckOnlineWith(serial string, timeout time.Duration, retries int) bool {
 	if retries < 1 {
 		retries = 1
 	}
+	PaceAcquire()
+	atomic.AddInt64(&paceActive, 1)
+	defer atomic.AddInt64(&paceActive, -1)
 	prof := SmartPSSProfile
 
 	conn := getCheckConn()
