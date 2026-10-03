@@ -126,7 +126,6 @@ func (s *Scanner) Run() {
 	s.writePwnedStart()
 
 	onlineChan := make(chan string, s.Threads*2)
-	handshakeChan := make(chan string, nurses*2)
 
 	s.startTime = time.Now()
 	s.lastSample = s.startTime
@@ -159,34 +158,33 @@ func (s *Scanner) Run() {
 		}()
 	}
 
-	var nurseWg sync.WaitGroup
-	for i := 0; i < nurses; i++ {
-		nurseWg.Add(1)
-		go func() {
-			defer nurseWg.Done()
-			for serial := range handshakeChan {
-				select {
-				case <-s.cancelChan:
-					return
-				default:
-				}
-				online := p2p.CheckOnlineWith(serial, connTimeout, retries)
-				if !online {
-					s.mu.Lock()
-					s.WasteCount++
-					s.CompletedCount++
-					s.mu.Unlock()
-					continue
-				}
-				LogOnlineFound(serial)
-				select {
-				case onlineChan <- serial:
-				case <-s.cancelChan:
-					return
-				}
-			}
-		}()
+	pipe, err := p2p.NewCheckPipe(nurses, s.cancelChan)
+	if err != nil {
+		scanRed.Printf("[!] %s\n", err)
+		return
 	}
+	jobs := pipe.Jobs()
+
+	var verdictWg sync.WaitGroup
+	verdictWg.Add(1)
+	go func() {
+		defer verdictWg.Done()
+		for v := range pipe.Verdicts() {
+			if v.Alive {
+				LogOnlineFound(v.Serial)
+				select {
+				case onlineChan <- v.Serial:
+				case <-s.cancelChan:
+					return
+				}
+			} else {
+				s.mu.Lock()
+				s.WasteCount++
+				s.CompletedCount++
+				s.mu.Unlock()
+			}
+		}
+	}()
 
 	for _, target := range s.Targets {
 		if len(target) == 15 {
@@ -195,7 +193,7 @@ func (s *Scanner) Run() {
 				goto cleanup
 			default:
 			}
-			handshakeChan <- target
+			jobs <- target
 		} else if len(target) == 10 {
 			for _, r := range ranges {
 				for i := r.Start; i < r.End; i++ {
@@ -205,15 +203,15 @@ func (s *Scanner) Run() {
 					default:
 					}
 					suffix := fmt.Sprintf("%05X", i)
-					handshakeChan <- target + suffix
+					jobs <- target + suffix
 				}
 			}
 		}
 	}
 
 cleanup:
-	close(handshakeChan)
-	nurseWg.Wait()
+	pipe.Close()
+	verdictWg.Wait()
 	close(onlineChan)
 	s.wg.Wait()
 	s.snapshotWg.Wait()
@@ -897,8 +895,8 @@ func (s *Scanner) printProgress() {
 		}
 	}
 
-	line := fmt.Sprintf("[%s] pwned > %d | online > %d | waste > %d | %d/s [%s]",
-		pctStr, s.PwnedCount, s.OnlineCount, s.WasteCount, s.lastRate, formatElapsed(now.Sub(s.startTime)))
+	line := fmt.Sprintf("[%s] pwned > %d | online > %d | waste > %d | %d/s [%s] gov:%d",
+		pctStr, s.PwnedCount, s.OnlineCount, s.WasteCount, s.lastRate, formatElapsed(now.Sub(s.startTime)), p2p.PipeRPS())
 	fmt.Printf("\033[2K\r%s", line)
 }
 
