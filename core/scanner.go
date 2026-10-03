@@ -895,8 +895,8 @@ func (s *Scanner) printProgress() {
 		}
 	}
 
-	line := fmt.Sprintf("[%s] pwned > %d | online > %d | waste > %d | %d/s [%s] gov:%d",
-		pctStr, s.PwnedCount, s.OnlineCount, s.WasteCount, s.lastRate, formatElapsed(now.Sub(s.startTime)), p2p.PipeRPS())
+	line := fmt.Sprintf("[%s] pwned > %d | online > %d | waste > %d | %d/s [%s]",
+		pctStr, s.PwnedCount, s.OnlineCount, s.WasteCount, s.lastRate, formatElapsed(now.Sub(s.startTime)))
 	fmt.Printf("\033[2K\r%s", line)
 }
 

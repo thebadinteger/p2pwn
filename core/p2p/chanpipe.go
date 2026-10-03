@@ -112,9 +112,6 @@ var (
 	pipeSharedLimiter *pipeLimiter
 )
 
-// report the current governor rate ceiling
-func PipeRPS() int { return int(atomic.LoadInt64(&pipeGovPPS)) }
-
 func pipeLimiterShared() *pipeLimiter {
 	pipeGovOnce.Do(func() {
 		pipeSharedLimiter = newPipeLimiter(pipeStartRPS, pipeBurst)
@@ -216,20 +213,21 @@ type pipeGrave struct {
 }
 
 type checkPipeline struct {
-	conn      *net.UDPConn
-	lport     int
-	timeout   time.Duration
-	grace     time.Duration
-	window    int
-	sent      int64
-	resolved  int64
-	expired   int64
-	inflight  map[uint32]*pipeInflight
-	graveyard map[uint32]*pipeGrave
-	buf       []byte
-	limiter   *pipeLimiter
-	done      <-chan struct{}
-	verdicts  chan<- PipeVerdict
+	conn          *net.UDPConn
+	lport         int
+	timeout       time.Duration
+	grace         time.Duration
+	window        int
+	sent          int64
+	resolved      int64
+	expired       int64
+	inflight      map[uint32]*pipeInflight
+	graveyard     map[uint32]*pipeGrave
+	buf           []byte
+	limiter       *pipeLimiter
+	done          <-chan struct{}
+	verdicts      chan<- PipeVerdict
+	lastReconnect time.Time
 }
 
 func pipeChannelBody(lport int, aid []byte) string {
@@ -274,6 +272,38 @@ func pipeRespCSeq(resp *DHResponse) (uint32, bool) {
 	return uint32(v), true
 }
 
+// report a socket-level failure
+func isUDPHardError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "forcibly closed") ||
+		strings.Contains(s, "broken pipe")
+}
+
+func (p *checkPipeline) reconnect() {
+	if time.Since(p.lastReconnect) < time.Second {
+		return
+	}
+	p.lastReconnect = time.Now()
+	raddr, _ := p.conn.RemoteAddr().(*net.UDPAddr)
+	p.conn.Close()
+	if raddr == nil {
+		return
+	}
+	conn, err := net.DialUDP("udp4", nil, raddr)
+	if err != nil {
+		return
+	}
+	conn.SetWriteBuffer(64 * 1024)
+	conn.SetReadBuffer(256 * 1024)
+	p.conn = conn
+	p.lport = conn.LocalAddr().(*net.UDPAddr).Port
+}
+
 func (p *checkPipeline) waitRate() bool {
 	if p.limiter == nil {
 		return true
@@ -301,6 +331,9 @@ func (p *checkPipeline) send(serial string) bool {
 	req := SmartPSSProfile.buildRequest(SmartPSSProfile.verbFor(body), "/device/"+serial+"/p2p-channel", body, true, cseq)
 	p.conn.SetWriteDeadline(time.Now().Add(p.timeout))
 	if _, err := p.conn.Write(req); err != nil {
+		if isUDPHardError(err) {
+			p.reconnect()
+		}
 		return false
 	}
 	p.inflight[cseq] = &pipeInflight{serial: serial, deadline: time.Now().Add(p.timeout), sentAt: time.Now()}
@@ -319,6 +352,9 @@ func (p *checkPipeline) readResp(dl time.Time) (*DHResponse, bool) {
 	p.conn.SetReadDeadline(dl)
 	n, err := p.conn.Read(p.buf)
 	if err != nil {
+		if isUDPHardError(err) {
+			p.reconnect()
+		}
 		return nil, false
 	}
 	resp, perr := parseDHResponse(p.buf[:n])
@@ -404,6 +440,9 @@ func (p *checkPipeline) sendRetry(g *pipeGrave) {
 	req := SmartPSSProfile.buildRequest(SmartPSSProfile.verbFor(body), "/device/"+g.serial+"/p2p-channel", body, true, cseq)
 	p.conn.SetWriteDeadline(time.Now().Add(p.timeout))
 	if _, err := p.conn.Write(req); err != nil {
+		if isUDPHardError(err) {
+			p.reconnect()
+		}
 		p.emit(g.serial, false)
 		return
 	}
@@ -504,7 +543,7 @@ type CheckPipe struct {
 	jobs     chan string
 	verdicts chan PipeVerdict
 	wg       sync.WaitGroup
-	conns    []*net.UDPConn
+	pipes    []*checkPipeline
 	done     <-chan struct{}
 }
 
@@ -534,7 +573,6 @@ func NewCheckPipe(workers int, done <-chan struct{}) (*CheckPipe, error) {
 		jobs:     make(chan string, len(conns)*10),
 		verdicts: make(chan PipeVerdict, len(conns)*10),
 		done:     done,
-		conns:    conns,
 	}
 	for _, conn := range conns {
 		w := &checkPipeline{
@@ -550,6 +588,7 @@ func NewCheckPipe(workers int, done <-chan struct{}) (*CheckPipe, error) {
 			done:      done,
 			verdicts:  c.verdicts,
 		}
+		c.pipes = append(c.pipes, w)
 		c.wg.Add(1)
 		go func(w *checkPipeline) {
 			defer c.wg.Done()
@@ -590,7 +629,7 @@ func (c *CheckPipe) Close() {
 	close(c.jobs)
 	c.wg.Wait()
 	close(c.verdicts)
-	for _, conn := range c.conns {
-		conn.Close()
+	for _, p := range c.pipes {
+		p.conn.Close()
 	}
 }
