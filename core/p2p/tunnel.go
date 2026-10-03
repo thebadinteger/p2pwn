@@ -1513,6 +1513,11 @@ func (t *PTCPTunnel) Snapshot() ([]byte, error) {
 	return nil, fmt.Errorf("snapshot failed on all CGI URL variants")
 }
 
+const (
+	jpegHuntMaxSOI = 2048
+	jpegHuntMaxEOI = 8
+)
+
 func ExtractJPEG(resp []byte) ([]byte, bool) {
 	headerEnd := findHeaderEnd(resp)
 	if headerEnd < 0 {
@@ -1525,24 +1530,55 @@ func ExtractJPEG(resp []byte) ([]byte, bool) {
 		body = DechunkHTTP(body)
 	}
 
+	// two-phase hunt
+	var best []byte
+	var fallback []byte
 	off := 0
-	for off+1 < len(body) {
+	for scanned := 0; off+1 < len(body) && scanned < jpegHuntMaxSOI; {
 		rel := bytes.Index(body[off:], []byte{0xFF, 0xD8})
 		if rel < 0 {
 			break
 		}
 		soi := off + rel
-		eoiRel := bytes.Index(body[soi+2:], []byte{0xFF, 0xD9})
-		if eoiRel < 0 {
+		off = soi + 2
+		scanned++
+		// an EOI closer than 1000 bytes cant be accepted
+		eoiFrom := soi + 998
+		if eoiFrom < soi+2 {
+			eoiFrom = soi + 2
+		}
+		if eoiFrom > len(body)-2 {
 			break
 		}
-		candidate := body[soi : soi+2+eoiRel+2]
-		if len(candidate) >= 1000 && (decodableJPEG(candidate) || StructurallyValidJPEG(candidate)) {
-			return candidate, true
+		for tried := 0; tried < jpegHuntMaxEOI; tried++ {
+			eoiRel := bytes.Index(body[eoiFrom:], []byte{0xFF, 0xD9})
+			if eoiRel < 0 {
+				break
+			}
+			eoi := eoiFrom + eoiRel
+			candidate := body[soi : eoi+2]
+			eoiFrom = eoi + 2
+			if len(candidate) < 1000 {
+				continue
+			}
+			if fallback == nil && StructurallyValidJPEG(candidate) {
+				fallback = candidate
+			}
+			if decodableJPEG(candidate) {
+				if len(candidate) > len(best) {
+					best = candidate
+				}
+				break
+			}
 		}
-		off = soi + 2
 	}
 
+	if best != nil {
+		return best, true
+	}
+	if fallback != nil {
+		return fallback, true
+	}
 	return nil, false
 }
 
