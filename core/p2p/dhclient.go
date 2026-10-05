@@ -136,11 +136,16 @@ func parseDHResponse(data []byte) (*DHResponse, error) {
 	}
 
 	for _, line := range headerLines[1:] {
-		if idx := strings.Index(line, ": "); idx > 0 {
-			key := strings.TrimSpace(line[:idx])
-			value := strings.TrimSpace(line[idx+2:])
-			resp.Headers[key] = value
+		idx := strings.Index(line, ":")
+		if idx <= 0 {
+			continue
 		}
+		key := strings.TrimSpace(line[:idx])
+		value := strings.TrimSpace(line[idx+1:])
+		if key == "" {
+			continue
+		}
+		resp.Headers[key] = value
 	}
 
 	if len(parts) > 1 {

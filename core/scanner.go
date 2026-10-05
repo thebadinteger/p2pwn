@@ -48,7 +48,13 @@ type Scanner struct {
 	cancelOnce sync.Once
 	pwnedList  []ExploitResult
 	cancelChan chan struct{}
+	hsSem      chan struct{}
 }
+
+const (
+	maxConcurrentHandshakes = 20
+	cleanupWatchdogTimeout  = 10 * time.Minute
+)
 
 func NewScanner(targets []string, config *Config, threads int, outDir string, inputSource string) *Scanner {
 	return &Scanner{
@@ -58,6 +64,7 @@ func NewScanner(targets []string, config *Config, threads int, outDir string, in
 		OutDir:      outDir,
 		InputSource: inputSource,
 		cancelChan:  make(chan struct{}),
+		hsSem:       make(chan struct{}, maxConcurrentHandshakes),
 	}
 }
 

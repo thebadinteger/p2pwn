@@ -261,10 +261,18 @@ func pipeAlive(resp *DHResponse) bool {
 }
 
 func pipeRespCSeq(resp *DHResponse) (uint32, bool) {
-	h, ok := resp.Headers["CSeq"]
-	if !ok || h == "" {
-		return 0, false
+	if h, ok := resp.Headers["CSeq"]; ok {
+		return pipeParseCSeq(h)
 	}
+	for k, h := range resp.Headers {
+		if strings.EqualFold(k, "CSeq") {
+			return pipeParseCSeq(h)
+		}
+	}
+	return 0, false
+}
+
+func pipeParseCSeq(h string) (uint32, bool) {
 	v, err := strconv.ParseUint(strings.TrimSpace(h), 10, 32)
 	if err != nil || v == 0 {
 		return 0, false
