@@ -463,8 +463,19 @@ func (t *PTCPTunnel) DoHTTPAuth(req []byte, timeout time.Duration) ([]byte, erro
 }
 
 func (t *PTCPTunnel) DoHTTPAuthStrict(req []byte, timeout time.Duration) ([]byte, error) {
+	resp, err := t.doHTTPAuthStrictOnPort(req, timeout, DefaultHTTPPort)
+	if err == nil {
+		return resp, nil
+	}
+	if p := t.customHTTPPort(); p > 0 {
+		return t.doHTTPAuthStrictOnPort(req, timeout, p)
+	}
+	return resp, err
+}
+
+func (t *PTCPTunnel) doHTTPAuthStrictOnPort(req []byte, timeout time.Duration, port int) ([]byte, error) {
 	realm1 := rand.Uint32()
-	if err := t.doBind(realm1); err != nil {
+	if err := t.doBindPort(realm1, port); err != nil {
 		return nil, fmt.Errorf("bind: %w", err)
 	}
 	defer t.DisconnectRealm(realm1)
@@ -494,7 +505,7 @@ func (t *PTCPTunnel) DoHTTPAuthStrict(req []byte, timeout time.Duration) ([]byte
 		}
 		authReq := insertAuthHeader(reqStr, selected)
 		realm2 := rand.Uint32()
-		if err := t.doBind(realm2); err != nil {
+		if err := t.doBindPort(realm2, port); err != nil {
 			continue
 		}
 		authResp, authErr := t.DoHTTPOnRealm(realm2, []byte(authReq), timeout)
@@ -511,7 +522,7 @@ func (t *PTCPTunnel) DoHTTPAuthStrict(req []byte, timeout time.Duration) ([]byte
 	basicAuth := basicAuthHeader(t.user, t.pass)
 	authReq := insertAuthHeader(reqStr, basicAuth)
 	realmBasic := rand.Uint32()
-	if err := t.doBind(realmBasic); err == nil {
+	if err := t.doBindPort(realmBasic, port); err == nil {
 		authResp, authErr := t.DoHTTPOnRealm(realmBasic, []byte(authReq), timeout)
 		t.DisconnectRealm(realmBasic)
 		if authErr == nil && len(authResp) > 0 && strings.Contains(string(authResp), "200 OK") && !strings.Contains(string(authResp), "401 Unauthorized") && !strings.Contains(string(authResp), "Invalid Authority") {
@@ -1248,8 +1259,23 @@ func dhipSessOf(pkt map[string]any) int {
 }
 
 func (t *PTCPTunnel) doHTTP(req []byte, timeout time.Duration) ([]byte, error) {
+	resp, err := t.doHTTPOnPort(req, timeout, DefaultHTTPPort)
+	if err == nil {
+		return resp, nil
+	}
+	if p := t.customHTTPPort(); p > 0 {
+		return t.doHTTPOnPort(req, timeout, p)
+	}
+	return resp, err
+}
+
+func (t *PTCPTunnel) doHTTPOnPort(req []byte, timeout time.Duration, port int) ([]byte, error) {
 	realm := rand.Uint32()
-	if err := t.doBind(realm); err != nil {
+	if port == DefaultHTTPPort {
+		if err := t.doBind(realm); err != nil {
+			return nil, fmt.Errorf("bind: %w", err)
+		}
+	} else if err := t.doBindPort(realm, port); err != nil {
 		return nil, fmt.Errorf("bind: %w", err)
 	}
 	defer t.DisconnectRealm(realm)
@@ -1257,14 +1283,17 @@ func (t *PTCPTunnel) doHTTP(req []byte, timeout time.Duration) ([]byte, error) {
 }
 
 func (t *PTCPTunnel) doBind(realm uint32) error {
+	return t.doBindPort(realm, DefaultHTTPPort)
+}
+
+func (t *PTCPTunnel) doBindPort(realm uint32, port int) error {
 	host := "127.0.0.1"
-	port := uint32(80)
 	ip := net.ParseIP(host)
 
 	bindBody := make([]byte, 20)
 	bindBody[0] = 0x11
 	binary.BigEndian.PutUint32(bindBody[4:8], realm)
-	binary.BigEndian.PutUint32(bindBody[12:16], port)
+	binary.BigEndian.PutUint32(bindBody[12:16], uint32(port))
 	copy(bindBody[16:20], ip.To4())
 
 	conn := t.conn

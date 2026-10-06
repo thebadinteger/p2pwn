@@ -374,11 +374,19 @@ func (c *DHClient) Handshake() error {
 	}
 	if infoResp, err := parseDHResponse(infoData); err == nil {
 		infoField := infoResp.XMLBody["body/Info"]
+		topFields := make(map[string]string, len(infoResp.XMLBody))
+		for k, v := range infoResp.XMLBody {
+			topFields[k] = v
+		}
 		if infoField == "" {
 			if m, jerr := decodeInfoJSONMap([]byte(strings.TrimSpace(infoResp.Body))); jerr == nil {
 				infoField = m["Info"]
+				for k, v := range m {
+					topFields[k] = v
+				}
 			}
 		}
+		var blobFields map[string]string
 		if infoField != "" {
 			if plain, err := DecryptDevInfo(infoField); err == nil {
 				if salt, err := decodeInfoRandSalt(plain); err == nil && salt != "" {
@@ -386,7 +394,13 @@ func (c *DHClient) Handshake() error {
 						c.randsalt = salt
 					}
 				}
+				if bf, err := decodeInfoJSONMap(plain); err == nil {
+					blobFields = bf
+				}
 			}
+		}
+		if h, p, r := parseCamPorts(blobFields, topFields); h != 0 || p != 0 || r != 0 {
+			rememberCamPorts(c.serial, h, p, r)
 		}
 	}
 

@@ -149,9 +149,21 @@ type rpc2ConnSession struct {
 }
 
 func newRPC2Conn(tunnel *p2p.PTCPTunnel) (*rpc2ConnSession, func(), error) {
+	var lastErr error
+	for _, port := range tunnel.HTTPTryPorts() {
+		if c, closeFn, err := newRPC2ConnOnPort(tunnel, port); err == nil {
+			return c, closeFn, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return nil, nil, lastErr
+}
+
+func newRPC2ConnOnPort(tunnel *p2p.PTCPTunnel, port int) (*rpc2ConnSession, func(), error) {
 	realm := rand.Uint32()
-	if err := tunnel.DoBindToPort(realm, 80); err != nil {
-		return nil, nil, fmt.Errorf("rpc2 bind port 80: %w", err)
+	if err := tunnel.DoBindToPort(realm, port); err != nil {
+		return nil, nil, fmt.Errorf("rpc2 bind port %d: %w", port, err)
 	}
 	c := &rpc2ConnSession{tunnel: tunnel, realm: realm, reqTimeout: 15 * time.Second}
 	return c, func() { tunnel.DisconnectRealm(realm) }, nil

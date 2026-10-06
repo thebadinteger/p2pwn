@@ -23,6 +23,19 @@ func NewSDKClient(tunnel *PTCPTunnel, user, pass string) *SDKClient {
 	}
 }
 
+func (s *SDKClient) bindRealm(realm uint32) error {
+	var lastErr error
+	for _, port := range s.tunnel.privTryPorts() {
+		target := fmt.Sprintf("127.0.0.1:%d", port)
+		if err := s.tunnel.doBindWithTarget(realm, target); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
 func (s *SDKClient) loginOnBind(realm uint32) (uint32, error) {
 	if err := s.tunnel.SendDataWithRealm(loginPacket(s.user, s.pass), realm); err != nil {
 		return realm, err
@@ -72,8 +85,8 @@ func loginPacket(user, pass string) []byte {
 
 func (s *SDKClient) Login() error {
 	realm := rand.Uint32()
-	if err := s.tunnel.doBindWithTarget(realm, "127.0.0.1:37777"); err != nil {
-		return fmt.Errorf("bind 37777: %w", err)
+	if err := s.bindRealm(realm); err != nil {
+		return fmt.Errorf("bind sdk: %w", err)
 	}
 	defer s.tunnel.DisconnectRealm(realm)
 	_, err := s.loginOnBind(realm)
@@ -119,8 +132,8 @@ func parseChallengeBody(body []byte) (realm, random string) {
 
 func (s *SDKClient) loginWithHashNewRealm(challengeRealm, challengeRandom string) (uint32, error) {
 	realm := rand.Uint32()
-	if err := s.tunnel.doBindWithTarget(realm, "127.0.0.1:37777"); err != nil {
-		return realm, fmt.Errorf("bind 37777: %w", err)
+	if err := s.bindRealm(realm); err != nil {
+		return realm, fmt.Errorf("bind sdk: %w", err)
 	}
 
 	if ch, err := s.tunnel.readOneDataForRealm(realm, time.Second); err == nil && len(ch) > 0 {
@@ -177,7 +190,7 @@ func sdkCmdGetChannels() []byte {
 
 func (s *SDKClient) GetDeviceInfo() (serial, model string, channels int, err error) {
 	realm := rand.Uint32()
-	if err := s.tunnel.doBindWithTarget(realm, "127.0.0.1:37777"); err != nil {
+	if err := s.bindRealm(realm); err != nil {
 		return "", "", 0, fmt.Errorf("bind: %w", err)
 	}
 	defer s.tunnel.DisconnectRealm(realm)
@@ -245,7 +258,7 @@ func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
 	}
 
 	realm := rand.Uint32()
-	if err := s.tunnel.doBindWithTarget(realm, "127.0.0.1:37777"); err != nil {
+	if err := s.bindRealm(realm); err != nil {
 		return nil, fmt.Errorf("snapshot bind: %w", err)
 	}
 	defer s.tunnel.DisconnectRealm(realm)
@@ -265,77 +278,42 @@ func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
 		return nil, fmt.Errorf("snapshot send: %w", err)
 	}
 
-	var data []byte
-	for {
+	var jpegData []byte
+	for i := 0; i < 64; i++ {
 		chunk, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second)
 		if err != nil {
-			if len(data) > 0 {
-				break
-			}
-			return nil, fmt.Errorf("snapshot read: %w", err)
+			break
 		}
-		data = append(data, chunk...)
-		if containsJPEGEnd(data) {
-			for {
-				tail, tailErr := s.tunnel.readDataSkipDisc(realm, 50*time.Millisecond)
-				if tailErr != nil {
-					break
-				}
-				data = append(data, tail...)
-			}
+		if len(chunk) == 0 {
+			continue
+		}
+		jpegData = append(jpegData, chunk...)
+		if len(jpegData) > 16*1024*1024 {
+			return nil, fmt.Errorf("snapshot: frame too large")
+		}
+		if containsJPEGEnd(jpegData) {
 			break
 		}
 	}
 
-	if len(data) >= 32 {
-		data = data[32:]
+	soi := bytes.Index(jpegData, []byte{0xff, 0xd8})
+	if soi < 0 {
+		return nil, fmt.Errorf("snapshot: no SOI found (%d bytes)", len(jpegData))
 	}
+	jpegData = jpegData[soi:]
 
-	data = stripSnapshotGarbage(data, ch)
-
-	if soi := bytes.Index(data, []byte{0xff, 0xd8}); soi >= 0 {
-		data = data[soi:]
-		if eoi := bytes.LastIndex(data, []byte{0xff, 0xd9}); eoi >= 0 {
-			data = data[:eoi+2]
-		}
+	eoi := bytes.LastIndex(jpegData, []byte{0xff, 0xd9})
+	if eoi < 0 {
+		return nil, fmt.Errorf("snapshot: no EOI found (%d bytes)", len(jpegData))
 	}
+	jpegData = jpegData[:eoi+2]
 
-	return data, nil
+	if len(jpegData) < 1000 {
+		return nil, fmt.Errorf("snapshot: invalid jpeg (%d bytes)", len(jpegData))
+	}
+	return jpegData, nil
 }
 
 func containsJPEGEnd(data []byte) bool {
 	return bytes.Contains(data, []byte{0xff, 0xd9})
-}
-
-func stripSnapshotGarbage(data []byte, ch byte) []byte {
-	garbage1 := []byte{0x0a, ch, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00}
-	garbage2 := []byte{0xbc, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, ch}
-
-	for {
-		idx := bytes.Index(data, garbage1)
-		if idx < 0 {
-			break
-		}
-		start := idx - 24
-		if start < 0 {
-			start = 0
-		}
-		end := idx + len(garbage1)
-		if end > len(data) {
-			end = len(data)
-		}
-		data = append(data[:start], data[end:]...)
-	}
-	for {
-		idx := bytes.Index(data, garbage2)
-		if idx < 0 {
-			break
-		}
-		end := idx + 32
-		if end > len(data) {
-			end = len(data)
-		}
-		data = append(data[:idx], data[end:]...)
-	}
-	return data
 }
