@@ -4,6 +4,7 @@ package p2p
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"sort"
@@ -15,7 +16,7 @@ import (
 )
 
 const (
-	pipeWindowStart    = 8
+	pipeWindowStart    = 32
 	pipeWindowMin      = 8
 	pipeWindowMax      = 128
 	pipeWindowGrow     = 8
@@ -25,11 +26,15 @@ const (
 	pipeChannelRetries = 2
 	pipeMaxRPS         = 3000
 	pipeBurst          = 64
-	pipeStartRPS       = 500
-	pipeFloorRPS       = 100
-	pipeTick           = 1 * time.Second
+	pipeStartRPS       = 150
+	pipeFloorRPS       = 50
+	pipeTick           = 2500 * time.Millisecond
+	pipeSlowStartPct   = 3
+	pipeCaPct          = 15
+	pipeBackoffPct     = 15
 	pipeRTTRing        = 512
 	pipeWarmupWait     = 2 * time.Second
+	pipeTeardownAlive  = true
 )
 
 type PipeVerdict struct {
@@ -59,7 +64,27 @@ func newPipeLimiter(rps, burst int) *pipeLimiter {
 	}
 }
 
-func (rl *pipeLimiter) wait(done <-chan struct{}) bool {
+// nonblocking slot claim for the hot loop
+func (rl *pipeLimiter) tryReserve() bool {
+	if rl == nil {
+		return true
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	earliest := now.Add(-rl.burst)
+	if rl.next.Before(earliest) {
+		rl.next = earliest
+	}
+	if rl.next.After(now) {
+		return false
+	}
+	rl.next = rl.next.Add(rl.interval)
+	return true
+}
+
+// blocking slot claim for the idle path
+func (rl *pipeLimiter) blockRate(done <-chan struct{}) bool {
 	if rl == nil {
 		return true
 	}
@@ -90,6 +115,19 @@ func (rl *pipeLimiter) wait(done <-chan struct{}) bool {
 	}
 }
 
+func (rl *pipeLimiter) nextDelay() time.Duration {
+	if rl == nil {
+		return 0
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	d := time.Until(rl.next)
+	if d < 0 {
+		d = 0
+	}
+	return d
+}
+
 func (rl *pipeLimiter) setRPS(rps int) {
 	if rl == nil || rps <= 0 {
 		return
@@ -103,8 +141,10 @@ func (rl *pipeLimiter) setRPS(rps int) {
 var (
 	pipeGovPPS        int64 = pipeStartRPS
 	pipeGovSlow       int64 = 1
+	pipeGovHealthy    int64
 	pipeGovOK         int64
 	pipeGovTO         int64
+	pipeGovErr        int64
 	pipeGovRTT        [pipeRTTRing]int64
 	pipeGovRTTIdx     int64
 	pipeGovRTTBase    int64
@@ -112,11 +152,27 @@ var (
 	pipeSharedLimiter *pipeLimiter
 )
 
+func pipeResetGov() {
+	atomic.StoreInt64(&pipeGovPPS, pipeStartRPS)
+	atomic.StoreInt64(&pipeGovSlow, 1)
+	atomic.StoreInt64(&pipeGovHealthy, 0)
+	atomic.StoreInt64(&pipeGovOK, 0)
+	atomic.StoreInt64(&pipeGovTO, 0)
+	atomic.StoreInt64(&pipeGovErr, 0)
+	atomic.StoreInt64(&pipeGovRTTIdx, 0)
+	atomic.StoreInt64(&pipeGovRTTBase, 0)
+	for i := range pipeGovRTT {
+		atomic.StoreInt64(&pipeGovRTT[i], 0)
+	}
+}
+
 func pipeLimiterShared() *pipeLimiter {
 	pipeGovOnce.Do(func() {
 		pipeSharedLimiter = newPipeLimiter(pipeStartRPS, pipeBurst)
 		go pipeGovernorLoop()
 	})
+	pipeResetGov()
+	pipeSharedLimiter.setRPS(pipeStartRPS)
 	return pipeSharedLimiter
 }
 
@@ -129,6 +185,8 @@ func pipeRecordOK(rtt time.Duration) {
 }
 
 func pipeRecordTO() { atomic.AddInt64(&pipeGovTO, 1) }
+
+func pipeRecordErr() { atomic.AddInt64(&pipeGovErr, 1) }
 
 func pipeMedianRTT() int64 {
 	vals := make([]int64, 0, pipeRTTRing)
@@ -144,19 +202,23 @@ func pipeMedianRTT() int64 {
 	return vals[len(vals)/2]
 }
 
+// slow start then aimd with rtt bloat guard
 func pipeGovernorLoop() {
 	t := time.NewTicker(pipeTick)
 	defer t.Stop()
 	for range t.C {
 		ok := atomic.SwapInt64(&pipeGovOK, 0)
 		to := atomic.SwapInt64(&pipeGovTO, 0)
-		total := ok + to
+		er := atomic.SwapInt64(&pipeGovErr, 0)
+		total := ok + to + er
 		if total == 0 {
 			continue
 		}
-		lossPct := float64(to) * 100 / float64(total)
-		pps := int(atomic.LoadInt64(&pipeGovPPS))
+		lossPct := float64(to+er) * 100 / float64(total)
+
+		pps := atomic.LoadInt64(&pipeGovPPS)
 		newPPS := pps
+		hard := false
 
 		bloat := false
 		if med := pipeMedianRTT(); med > 0 {
@@ -164,7 +226,7 @@ func pipeGovernorLoop() {
 			if base > 0 && med > base*5/2 {
 				bloat = true
 			}
-			if lossPct < 3 {
+			if lossPct < float64(pipeSlowStartPct) {
 				if base == 0 {
 					atomic.StoreInt64(&pipeGovRTTBase, med)
 				} else {
@@ -174,16 +236,25 @@ func pipeGovernorLoop() {
 		}
 
 		switch {
-		case lossPct > 15:
+		case (er >= 3 && er*100 >= total*5) || lossPct > float64(pipeBackoffPct):
 			newPPS = pps / 2
 			atomic.StoreInt64(&pipeGovSlow, 0)
+			hard = true
 		case bloat:
 			newPPS = pps * 7 / 10
 			atomic.StoreInt64(&pipeGovSlow, 0)
-		case lossPct < 3 && atomic.LoadInt64(&pipeGovSlow) == 1:
-			newPPS = pps * 2
-		case lossPct < 15:
+			hard = true
+		case lossPct < float64(pipeSlowStartPct) && atomic.LoadInt64(&pipeGovSlow) == 1:
+			newPPS = pps * 3 / 2
+		case lossPct < float64(pipeCaPct):
 			newPPS = pps + pps/20
+		}
+		if !hard && lossPct < float64(pipeSlowStartPct) {
+			if atomic.AddInt64(&pipeGovHealthy, 1) >= 8 {
+				atomic.StoreInt64(&pipeGovSlow, 1)
+			}
+		} else {
+			atomic.StoreInt64(&pipeGovHealthy, 0)
 		}
 		if newPPS < pipeFloorRPS {
 			newPPS = pipeFloorRPS
@@ -192,14 +263,15 @@ func pipeGovernorLoop() {
 			newPPS = pipeMaxRPS
 		}
 		if newPPS != pps {
-			atomic.StoreInt64(&pipeGovPPS, int64(newPPS))
-			pipeSharedLimiter.setRPS(newPPS)
+			atomic.StoreInt64(&pipeGovPPS, newPPS)
+			pipeSharedLimiter.setRPS(int(newPPS))
 		}
 	}
 }
 
 type pipeInflight struct {
 	serial   string
+	aid      []byte
 	deadline time.Time
 	extended bool
 	retries  int
@@ -208,6 +280,7 @@ type pipeInflight struct {
 
 type pipeGrave struct {
 	serial   string
+	aid      []byte
 	retries  int
 	deadline time.Time
 }
@@ -218,9 +291,10 @@ type checkPipeline struct {
 	timeout       time.Duration
 	grace         time.Duration
 	window        int
-	sent          int64
-	resolved      int64
-	expired       int64
+	resolvedCycle int64
+	expiredCycle  int64
+	expiredEMA    float64
+	emaSet        bool
 	inflight      map[uint32]*pipeInflight
 	graveyard     map[uint32]*pipeGrave
 	buf           []byte
@@ -235,7 +309,7 @@ func pipeChannelBody(lport int, aid []byte) string {
 	for _, b := range aid {
 		parts = append(parts, fmt.Sprintf("%x", b))
 	}
-	return fmt.Sprintf("<body><Identify>%s</Identify><IpEncrpt>true</IpEncrpt><LocalAddr>127.0.0.1:%d</LocalAddr><version>5.0.0</version>",
+	return fmt.Sprintf("<body><Identify>%s</Identify><IpEncrpt>true</IpEncrpt><LocalAddr>127.0.0.1:%d</LocalAddr><version>5.0.0</version></body>",
 		strings.Join(parts, " "), lport)
 }
 
@@ -280,7 +354,7 @@ func pipeParseCSeq(h string) (uint32, bool) {
 	return uint32(v), true
 }
 
-// report a socket-level failure
+// socket level failure as opposed to a normal timeout
 func isUDPHardError(err error) bool {
 	if err == nil {
 		return false
@@ -292,6 +366,8 @@ func isUDPHardError(err error) bool {
 		strings.Contains(s, "broken pipe")
 }
 
+// a connected udp socket poisoned by icmp unreachable errors on every
+// read forever redial gives the worker a clean one
 func (p *checkPipeline) reconnect() {
 	if time.Since(p.lastReconnect) < time.Second {
 		return
@@ -312,11 +388,25 @@ func (p *checkPipeline) reconnect() {
 	p.lport = conn.LocalAddr().(*net.UDPAddr).Port
 }
 
-func (p *checkPipeline) waitRate() bool {
+func (p *checkPipeline) tryRate() bool {
 	if p.limiter == nil {
 		return true
 	}
-	return p.limiter.wait(p.done)
+	return p.limiter.tryReserve()
+}
+
+func (p *checkPipeline) blockRate() bool {
+	if p.limiter == nil {
+		return true
+	}
+	return p.limiter.blockRate(p.done)
+}
+
+func (p *checkPipeline) nextRateDelay() time.Duration {
+	if p.limiter == nil {
+		return 0
+	}
+	return p.limiter.nextDelay()
 }
 
 func (p *checkPipeline) cancelled() bool {
@@ -329,9 +419,6 @@ func (p *checkPipeline) cancelled() bool {
 }
 
 func (p *checkPipeline) send(serial string) bool {
-	if !p.waitRate() {
-		return false
-	}
 	cseq := SmartPSSProfile.nextCSeq()
 	aid := make([]byte, 8)
 	rand.Read(aid)
@@ -342,10 +429,10 @@ func (p *checkPipeline) send(serial string) bool {
 		if isUDPHardError(err) {
 			p.reconnect()
 		}
+		pipeRecordErr()
 		return false
 	}
-	p.inflight[cseq] = &pipeInflight{serial: serial, deadline: time.Now().Add(p.timeout), sentAt: time.Now()}
-	p.sent++
+	p.inflight[cseq] = &pipeInflight{serial: serial, aid: aid, deadline: time.Now().Add(p.timeout), sentAt: time.Now()}
 	return true
 }
 
@@ -401,16 +488,77 @@ func (p *checkPipeline) resolve(resp *DHResponse) {
 	}
 	if ir, found := p.inflight[cseq]; found {
 		delete(p.inflight, cseq)
-		p.resolved++
+		p.resolvedCycle++
 		pipeRecordOK(time.Since(ir.sentAt))
-		p.emit(ir.serial, pipeAlive(resp))
+		alive := pipeAlive(resp)
+		p.emit(ir.serial, alive)
+		if alive {
+			p.teardown(ir.aid, resp)
+		}
 		return
 	}
 	if g, found := p.graveyard[cseq]; found {
 		delete(p.graveyard, cseq)
-		p.resolved++
-		p.emit(g.serial, pipeAlive(resp))
+		p.resolvedCycle++
+		alive := pipeAlive(resp)
+		p.emit(g.serial, alive)
+		if alive {
+			p.teardown(g.aid, resp)
+		}
 		return
+	}
+}
+
+// release the cloud channel after an alive verdict
+func (p *checkPipeline) teardown(aid []byte, resp *DHResponse) {
+	if !pipeTeardownAlive {
+		return
+	}
+	inv := make([]byte, 8)
+	for i, b := range aid {
+		inv[i] = ^b
+	}
+	build := func(eaddr []byte) []byte {
+		out := make([]byte, 0, 40)
+		out = append(out, 0xFF, 0xFE, 0xFF, 0xE7)
+		c1 := make([]byte, 8)
+		rand.Read(c1)
+		c2 := make([]byte, 8)
+		rand.Read(c2)
+		out = append(out, c1[:4]...)
+		out = append(out, c2[:]...)
+		out = append(out, c1[4:]...)
+		out = append(out, 0x7F, 0xD5, 0xFF, 0xF7)
+		out = append(out, inv...)
+		out = append(out, 0xFF, 0xFB, 0xFF, 0xF7, 0xFF, 0xFE)
+		out = append(out, eaddr...)
+		return out
+	}
+	for _, addrStr := range []string{
+		pipeTagValue(resp.Body, "LocalAddr"),
+		pipeTagValue(resp.Body, "PubAddr"),
+	} {
+		host, portStr, err := net.SplitHostPort(addrStr)
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(host).To4()
+		if ip == nil {
+			continue
+		}
+		eaddr := make([]byte, 6)
+		binary.BigEndian.PutUint16(eaddr[0:2], uint16(port))
+		copy(eaddr[2:], ip)
+		for i := range eaddr {
+			eaddr[i] = ^eaddr[i]
+		}
+		init := build(eaddr)
+		p.conn.WriteTo(init, &net.UDPAddr{IP: ip, Port: port})
+		p.conn.Write(init)
 	}
 }
 
@@ -419,28 +567,29 @@ func (p *checkPipeline) expire() {
 	for c, ir := range p.inflight {
 		if now.After(ir.deadline) {
 			delete(p.inflight, c)
-			p.expired++
+			p.expiredCycle++
 			pipeRecordTO()
-			p.graveyard[c] = &pipeGrave{serial: ir.serial, retries: ir.retries, deadline: now.Add(p.grace)}
+			p.graveyard[c] = &pipeGrave{serial: ir.serial, aid: ir.aid, retries: ir.retries, deadline: now.Add(p.grace)}
 		}
 	}
 	for c, g := range p.graveyard {
 		if now.After(g.deadline) {
-			delete(p.graveyard, c)
 			if g.retries >= pipeChannelRetries {
+				delete(p.graveyard, c)
 				p.emit(g.serial, false)
 				continue
 			}
+			if !p.tryRate() {
+				g.deadline = now.Add(p.nextRateDelay() + time.Millisecond)
+				continue
+			}
+			delete(p.graveyard, c)
 			p.sendRetry(g)
 		}
 	}
 }
 
 func (p *checkPipeline) sendRetry(g *pipeGrave) {
-	if !p.waitRate() {
-		p.emit(g.serial, false)
-		return
-	}
 	cseq := SmartPSSProfile.nextCSeq()
 	aid := make([]byte, 8)
 	rand.Read(aid)
@@ -451,53 +600,68 @@ func (p *checkPipeline) sendRetry(g *pipeGrave) {
 		if isUDPHardError(err) {
 			p.reconnect()
 		}
+		pipeRecordErr()
 		p.emit(g.serial, false)
 		return
 	}
-	p.inflight[cseq] = &pipeInflight{serial: g.serial, deadline: time.Now().Add(p.timeout), retries: g.retries + 1, sentAt: time.Now()}
-	p.sent++
+	p.inflight[cseq] = &pipeInflight{serial: g.serial, aid: aid, deadline: time.Now().Add(p.timeout), retries: g.retries + 1, sentAt: time.Now()}
 }
 
 func (p *checkPipeline) govern() {
-	total := p.resolved + p.expired
-	if total == 0 {
-		return
+	total := p.resolvedCycle + p.expiredCycle
+	if total > 0 {
+		share := float64(p.expiredCycle) / float64(total)
+		if p.emaSet {
+			p.expiredEMA = p.expiredEMA*7/8 + share/8
+		} else {
+			p.expiredEMA, p.emaSet = share, true
+		}
 	}
-	share := float64(p.expired) / float64(total)
 	switch {
-	case share < 0.02:
+	case p.emaSet && p.expiredEMA < 0.02:
 		p.window += pipeWindowGrow
 		if p.window > pipeWindowMax {
 			p.window = pipeWindowMax
 		}
-	case share > 0.10:
+	case p.emaSet && p.expiredEMA > 0.10:
 		p.window -= pipeWindowShrink
 		if p.window < pipeWindowMin {
 			p.window = pipeWindowMin
 		}
 	}
-	p.sent = 0
-	p.resolved, p.expired = 0, 0
+	p.resolvedCycle, p.expiredCycle = 0, 0
 }
 
-func (p *checkPipeline) pump() {
+func (p *checkPipeline) pump(maxWait time.Duration) {
 	dl := p.minDeadline()
 	wait := time.Until(dl)
+	if maxWait > 0 && maxWait < wait {
+		wait = maxWait
+	}
 	if wait < time.Millisecond {
 		wait = time.Millisecond
 	}
-	if resp, got := p.readResp(time.Now().Add(wait)); got {
-		p.resolve(resp)
+	resp, got := p.readResp(time.Now().Add(wait))
+	if !got {
+		p.expire()
+		return
 	}
+	p.resolve(resp)
 	p.expire()
 }
 
 func (p *checkPipeline) run(jobs <-chan string) {
+	var pumpCap time.Duration
 	for {
 		if p.cancelled() {
 			return
 		}
+		pumpCap = 0
 		for len(p.inflight) < p.window {
+			if !p.tryRate() {
+				pumpCap = p.nextRateDelay() + time.Millisecond
+				goto readPhase
+			}
 			select {
 			case <-p.done:
 				return
@@ -524,6 +688,9 @@ func (p *checkPipeline) run(jobs <-chan string) {
 				if !ok {
 					return
 				}
+				if !p.blockRate() {
+					return
+				}
 				if !p.send(s) {
 					if p.cancelled() {
 						return
@@ -533,15 +700,15 @@ func (p *checkPipeline) run(jobs <-chan string) {
 			}
 			continue
 		}
-		p.pump()
-		if p.resolved+p.expired >= int64(p.window) {
+		p.pump(pumpCap)
+		if p.resolvedCycle+p.expiredCycle >= int64(p.window) {
 			p.govern()
 		}
 	}
 drain:
 	for (len(p.inflight) > 0 || len(p.graveyard) > 0) && !p.cancelled() {
-		p.pump()
-		if p.resolved+p.expired >= int64(p.window) {
+		p.pump(0)
+		if p.resolvedCycle+p.expiredCycle >= int64(p.window) {
 			p.govern()
 		}
 	}
@@ -607,21 +774,21 @@ func NewCheckPipe(workers int, done <-chan struct{}) (*CheckPipe, error) {
 	return c, nil
 }
 
-func (w *checkPipeline) warmup() {
+func (p *checkPipeline) warmup() {
 	cseq := SmartPSSProfile.nextCSeq()
 	req := SmartPSSProfile.buildRequest("DHGET", "/probe/p2psrv", "", true, cseq)
-	w.conn.SetWriteDeadline(time.Now().Add(w.timeout))
-	if _, err := w.conn.Write(req); err != nil {
+	p.conn.SetWriteDeadline(time.Now().Add(p.timeout))
+	if _, err := p.conn.Write(req); err != nil {
 		return
 	}
 	dl := time.Now().Add(pipeWarmupWait)
 	for {
-		w.conn.SetReadDeadline(dl)
-		n, err := w.conn.Read(w.buf)
+		p.conn.SetReadDeadline(dl)
+		n, err := p.conn.Read(p.buf)
 		if err != nil {
 			return
 		}
-		if resp, perr := parseDHResponse(w.buf[:n]); perr == nil {
+		if resp, perr := parseDHResponse(p.buf[:n]); perr == nil {
 			if c, ok := pipeRespCSeq(resp); ok && c == cseq {
 				return
 			}
