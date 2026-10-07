@@ -32,6 +32,7 @@ type Scanner struct {
 	CompletedCount int64
 	PwnedCount     int64
 	OnlineCount    int64
+	AliveVerdicts  int64
 	SafeCount      int64
 	WasteCount     int64
 
@@ -179,6 +180,9 @@ func (s *Scanner) Run() {
 		for v := range pipe.Verdicts() {
 			if v.Alive {
 				LogOnlineFound(v.Serial)
+				s.mu.Lock()
+				s.AliveVerdicts++
+				s.mu.Unlock()
 				select {
 				case onlineChan <- v.Serial:
 				case <-s.cancelChan:
@@ -902,8 +906,8 @@ func (s *Scanner) printProgress() {
 		}
 	}
 
-	line := fmt.Sprintf("[%s] pwned > %d | online > %d | waste > %d | %d/s [%s]",
-		pctStr, s.PwnedCount, s.OnlineCount, s.WasteCount, s.lastRate, formatElapsed(now.Sub(s.startTime)))
+	line := fmt.Sprintf("[%s] pwned > %d | online > %d | found > %d | waste > %d | %d/s [%s]",
+		pctStr, s.PwnedCount, s.OnlineCount, s.AliveVerdicts, s.WasteCount, s.lastRate, formatElapsed(now.Sub(s.startTime)))
 	fmt.Printf("\033[2K\r%s", line)
 }
 
