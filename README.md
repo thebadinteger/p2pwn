@@ -99,6 +99,7 @@ timeout = 5000 # Connection timeout in milliseconds
 retries = 3 # Number of retries on connect
 generate = 1048576 # How many S/N to generate on prefix (1-1048576)
 nurses = 200 # Number of workers for checking online S/N
+maxrps = 3000 # Cap on concurrent online/offline checks
 
 [pwn] # Usage of different protocols and methods
 snapshot = true # Take snapshots
@@ -118,14 +119,14 @@ credentials = [
   { login = "admin", password = "admin12345" },
   { login = "666666", password = "666666" },
   { login = "888888", password = "888888" },
-]
+] # Credentials list or '/path/to/wordlist' > login:password
 
 [dummy] # Credentials for added dummy account
 login = "p2pwn" # 5-32 alphanumeric characters
 password = "p2password" # 8-32 alphanumeric characters
 
 [overlay] # Custom overlay configuration
-osd = true # Set OSD on pwned devices
+osd = false # Set OSD on pwned devices
 channel = "p2pwn" # ChannelTitle
 custom = [
   "p2pwned",
@@ -134,6 +135,7 @@ custom = [
 ```  
 Tips:  
 - `nurses` - The higher, the faster the S/N check (online/offline), but more packets
+- `maxrps` - Cap on concurrent online/offline checks (the higher, the faster)
 - `snapshot` - Takes snapshot of the first channel (Disabling it can speed up the scan)
 - `protocol.cgi` - Can check CVEs and brute
 - `protocol.sdk` - Can only brute (Disable to speed up the scan if not scanning NVRs)
