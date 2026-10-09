@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ type ScanConfig struct {
 	Retries  interface{} `toml:"retries"`
 	Generate interface{} `toml:"generate"`
 	Nurses   interface{} `toml:"nurses"`
+	MaxRPS   interface{} `toml:"maxrps"`
 }
 
 type PwnConfig struct {
@@ -34,7 +36,8 @@ type BruteType1Config struct {
 
 type BruteConfig struct {
 	Type1       BruteType1Config `toml:"type1"`
-	Credentials []Credential     `toml:"credentials"`
+	Credentials interface{}      `toml:"credentials"`
+	Creds       []Credential     `toml:"-"`
 }
 
 type DummyConfig struct {
@@ -62,6 +65,7 @@ timeout = 5000 # Connection timeout in milliseconds
 retries = 3 # Number of retries on connect
 generate = 1048576 # How many S/N to generate on prefix (1-1048576)
 nurses = 200 # Number of workers for checking online S/N
+maxrps = 3000 # Cap on concurrent online/offline checks
 
 [pwn] # Usage of different protocols and methods
 snapshot = true # Take snapshots
@@ -81,14 +85,14 @@ credentials = [
   { login = "admin", password = "admin12345" },
   { login = "666666", password = "666666" },
   { login = "888888", password = "888888" },
-]
+] # Credentials list or '/path/to/wordlist' > login:password
 
 [dummy] # Credentials for added dummy account
 login = "p2pwn" # 5-32 alphanumeric characters
 password = "p2password" # 8-32 alphanumeric characters
 
 [overlay] # Custom overlay configuration
-osd = true # Set OSD on pwned devices
+osd = false # Set OSD on pwned devices
 channel = "p2pwn" # ChannelTitle
 custom = [
   "p2pwned",
@@ -166,8 +170,9 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 		line := 1
 		if pe, ok := err.(toml.ParseError); ok {
 			line = pe.Position.Line
+			return nil, fmt.Errorf("error in config on line %d: %s", line, pe.Message)
 		}
-		return nil, fmt.Errorf("error in config on line %d", line)
+		return nil, fmt.Errorf("error in config: %s", err)
 	}
 
 	timeoutMs, err := getIntValue(conf.Scan.Timeout)
@@ -187,6 +192,13 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 	nursesVal, err := getIntValue(conf.Scan.Nurses)
 	if err != nil || nursesVal <= 0 {
 		return nil, fmt.Errorf("invalid nurses value in config")
+	}
+
+	if conf.Scan.MaxRPS != nil {
+		maxRPS, err := getIntValue(conf.Scan.MaxRPS)
+		if err != nil || maxRPS <= 0 {
+			return nil, fmt.Errorf("invalid maxrps value in config")
+		}
 	}
 
 	hasProtocol := false
@@ -224,8 +236,88 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 		return nil, fmt.Errorf("invalid overlay custom value in config (up to 5 lines)")
 	}
 
+	creds, err := resolveCredentials(conf.Brute.Credentials, path)
+	if err != nil {
+		return nil, err
+	}
+	conf.Brute.Creds = creds
+
 	conf.Path = path
 	return &conf, nil
+}
+
+// credentials may be an inline list or a path to a login:password wordlist
+func resolveCredentials(v interface{}, configPath string) ([]Credential, error) {
+	switch val := v.(type) {
+	case nil:
+		return nil, nil
+	case []Credential:
+		return val, nil
+	case string:
+		return loadWordlist(strings.TrimSpace(val), configPath)
+	case []map[string]interface{}:
+		return credsFromTables(val)
+	case []interface{}:
+		tables := make([]map[string]interface{}, 0, len(val))
+		for _, item := range val {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid credentials entry in config")
+			}
+			tables = append(tables, m)
+		}
+		return credsFromTables(tables)
+	default:
+		return nil, fmt.Errorf("invalid credentials value in config")
+	}
+}
+
+func credsFromTables(tables []map[string]interface{}) ([]Credential, error) {
+	out := make([]Credential, 0, len(tables))
+	for _, m := range tables {
+		login, _ := m["login"].(string)
+		password, _ := m["password"].(string)
+		login = strings.TrimSpace(login)
+		password = strings.TrimSpace(password)
+		if login == "" {
+			continue
+		}
+		out = append(out, Credential{Login: login, Password: password})
+	}
+	return out, nil
+}
+
+// comments skipped
+func loadWordlist(listPath, configPath string) ([]Credential, error) {
+	raw, err := os.ReadFile(listPath)
+	if err != nil && configPath != "" {
+		alt := filepath.Join(filepath.Dir(configPath), listPath)
+		raw, err = os.ReadFile(alt)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read credentials wordlist: %w", err)
+	}
+	var out []Credential
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		login, password, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		login = strings.TrimSpace(login)
+		password = strings.TrimSpace(password)
+		if login == "" {
+			continue
+		}
+		out = append(out, Credential{Login: login, Password: password})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("credentials wordlist has no usable entries")
+	}
+	return out, nil
 }
 
 func getIntValue(v interface{}) (int, error) {

