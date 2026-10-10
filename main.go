@@ -27,7 +27,8 @@ func xorDecode(data []byte, key byte) string {
 
 func printHelp() {
 	nowStr := time.Now().Format("15:04:05")
-	colRed.Printf("[%s] p2pwn\n", nowStr)
+	colRed.Printf("[%s] p2pwn ", nowStr)
+	fmt.Printf("- %s\n", core.RandomMOTD())
 	colWhite.Printf("[?] Dahua cameras security scanner via P2P\n")
 	fmt.Printf("[-i, --input] Input file or specific target(s)\n")
 	fmt.Printf("Format:\n")

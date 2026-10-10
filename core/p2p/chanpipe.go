@@ -140,6 +140,7 @@ func (rl *pipeLimiter) setRPS(rps int) {
 
 var (
 	pipeMaxRPS        int64 = pipeMaxRPSDefault
+	pipeGovOn         int64 = 1
 	pipeGovPPS        int64 = pipeStartRPS
 	pipeGovSlow       int64 = 1
 	pipeGovHealthy    int64
@@ -160,6 +161,14 @@ func SetPipeMaxRPS(rps int) {
 	atomic.StoreInt64(&pipeMaxRPS, int64(rps))
 }
 
+func SetPipeGovernor(on bool) {
+	if on {
+		atomic.StoreInt64(&pipeGovOn, 1)
+	} else {
+		atomic.StoreInt64(&pipeGovOn, 0)
+	}
+}
+
 func pipeResetGov() {
 	atomic.StoreInt64(&pipeGovPPS, pipeStartRPS)
 	atomic.StoreInt64(&pipeGovSlow, 1)
@@ -175,12 +184,19 @@ func pipeResetGov() {
 }
 
 func pipeLimiterShared() *pipeLimiter {
+	governorOn := atomic.LoadInt64(&pipeGovOn) == 1
 	pipeGovOnce.Do(func() {
 		pipeSharedLimiter = newPipeLimiter(pipeStartRPS, pipeBurst)
-		go pipeGovernorLoop()
+		if governorOn {
+			go pipeGovernorLoop()
+		}
 	})
 	pipeResetGov()
-	pipeSharedLimiter.setRPS(pipeStartRPS)
+	if governorOn {
+		pipeSharedLimiter.setRPS(pipeStartRPS)
+	} else {
+		pipeSharedLimiter.setRPS(int(atomic.LoadInt64(&pipeMaxRPS)))
+	}
 	return pipeSharedLimiter
 }
 
@@ -215,6 +231,9 @@ func pipeGovernorLoop() {
 	t := time.NewTicker(pipeTick)
 	defer t.Stop()
 	for range t.C {
+		if atomic.LoadInt64(&pipeGovOn) == 0 {
+			return
+		}
 		ok := atomic.SwapInt64(&pipeGovOK, 0)
 		to := atomic.SwapInt64(&pipeGovTO, 0)
 		er := atomic.SwapInt64(&pipeGovErr, 0)
@@ -814,10 +833,11 @@ type CheckPipe struct {
 	done     <-chan struct{}
 }
 
-func NewCheckPipe(workers int, done <-chan struct{}, maxRPS int) (*CheckPipe, error) {
+func NewCheckPipe(workers int, done <-chan struct{}, maxRPS int, governorOn bool) (*CheckPipe, error) {
 	if workers < 1 {
 		workers = 1
 	}
+	SetPipeGovernor(governorOn)
 	SetPipeMaxRPS(maxRPS)
 	limiter := pipeLimiterShared()
 	var conns []*net.UDPConn

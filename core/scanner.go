@@ -86,6 +86,20 @@ func (s *Scanner) maxRPS() int {
 	return 0
 }
 
+func (s *Scanner) governorOn() bool {
+	if s.Config.Scan.Governor == nil {
+		return true
+	}
+	if val, err := getBoolValue(s.Config.Scan.Governor); err == nil {
+		return val
+	}
+	return true
+}
+
+func isPrefix(target string) bool {
+	return len(target) == 10
+}
+
 func (s *Scanner) Run() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -119,18 +133,18 @@ func (s *Scanner) Run() {
 
 	var total int64 = 0
 	for _, target := range s.Targets {
-		if len(target) == 10 {
+		if isPrefix(target) {
 			for _, r := range ranges {
 				total += int64(r.End - r.Start)
 			}
-		} else if len(target) == 15 {
+		} else {
 			total++
 		}
 	}
 	s.TotalCount = total
 
 	nowStr := time.Now().Format("15:04:05")
-	scanRed.Printf("[%s] p2pwn\n", nowStr)
+	PrintBanner(nowStr)
 	fmt.Printf("[input] > %s\n", s.InputSource)
 	fmt.Printf("[count] > %d\n", s.TotalCount)
 	fmt.Printf("[output] > %s\n", s.OutDir)
@@ -174,7 +188,7 @@ func (s *Scanner) Run() {
 		}()
 	}
 
-	pipe, err := p2p.NewCheckPipe(nurses, s.cancelChan, s.maxRPS())
+	pipe, err := p2p.NewCheckPipe(nurses, s.cancelChan, s.maxRPS(), s.governorOn())
 	if err != nil {
 		scanRed.Printf("[!] %s\n", err)
 		return
@@ -206,14 +220,14 @@ func (s *Scanner) Run() {
 	}()
 
 	for _, target := range s.Targets {
-		if len(target) == 15 {
+		if !isPrefix(target) {
 			select {
 			case <-s.cancelChan:
 				goto cleanup
 			default:
 			}
 			jobs <- target
-		} else if len(target) == 10 {
+		} else {
 			for _, r := range ranges {
 				for i := r.Start; i < r.End; i++ {
 					select {

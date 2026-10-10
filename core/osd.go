@@ -11,6 +11,12 @@ import (
 	"github.com/thebadinteger/p2pwn/core/p2p"
 )
 
+const (
+	osdChannelMaxChars = 32
+	osdCustomMaxChars  = 22
+	osdCustomMaxLines  = 5
+)
+
 func normalizeOSDLines(custom []string) []string {
 	var out []string
 	for _, l := range custom {
@@ -18,11 +24,11 @@ func normalizeOSDLines(custom []string) []string {
 		if l == "" {
 			continue
 		}
-		if r := []rune(l); len(r) > 32 {
-			l = string(r[:32])
+		if r := []rune(l); len(r) > osdCustomMaxChars {
+			l = string(r[:osdCustomMaxChars])
 		}
 		out = append(out, l)
-		if len(out) >= 5 {
+		if len(out) >= osdCustomMaxLines {
 			break
 		}
 	}
@@ -31,8 +37,8 @@ func normalizeOSDLines(custom []string) []string {
 
 func normalizeOSDChannel(channel string) string {
 	channel = strings.TrimSpace(channel)
-	if r := []rune(channel); len(r) > 32 {
-		channel = string(r[:32])
+	if r := []rune(channel); len(r) > osdChannelMaxChars {
+		channel = string(r[:osdChannelMaxChars])
 	}
 	return channel
 }
@@ -41,11 +47,11 @@ func pipeJoin(lines []string) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	if len(lines) > 5 {
-		lines = lines[len(lines)-5:]
+	if len(lines) > osdCustomMaxLines {
+		lines = lines[len(lines)-osdCustomMaxLines:]
 	}
-	padded := make([]string, 5)
-	copy(padded[5-len(lines):], lines)
+	padded := make([]string, osdCustomMaxLines)
+	copy(padded[osdCustomMaxLines-len(lines):], lines)
 	return strings.Join(padded, "|")
 }
 

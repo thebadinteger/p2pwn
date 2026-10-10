@@ -99,6 +99,7 @@ timeout = 5000 # Connection timeout in milliseconds
 retries = 3 # Number of retries on connect
 generate = 1048576 # How many S/N to generate on prefix (1-1048576)
 nurses = 200 # Number of workers for checking online S/N
+governor = true # Enable/disable governor
 maxrps = 3000 # Cap on concurrent online/offline checks
 
 [pwn] # Usage of different protocols and methods
@@ -127,11 +128,11 @@ password = "p2password" # 8-32 alphanumeric characters
 
 [overlay] # Custom overlay configuration
 osd = false # Set OSD on pwned devices
-channel = "p2pwn" # ChannelTitle
+channel = "p2pwn" # ChannelTitle (max 32 char)
 custom = [
   "p2pwned",
   "device is vulnerable"
-] # CustomTitle (up to 5 lines)
+] # CustomTitle (up to 5 lines, max 22 char per line)
 ```  
 Tips:  
 - `nurses` - The higher, the faster the S/N check (online/offline), but more packets
