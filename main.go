@@ -69,6 +69,27 @@ func isDirReadOnly(dir string) bool {
 	return false
 }
 
+func looksLikeFilePath(input string) bool {
+	if strings.ContainsAny(input, `/\`) {
+		return true
+	}
+	dot := strings.LastIndex(input, ".")
+	if dot <= 0 || dot == len(input)-1 {
+		return false
+	}
+	ext := input[dot+1:]
+	if len(ext) > 5 {
+		return false
+	}
+	for _, r := range ext {
+		isAlnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if !isAlnum {
+			return false
+		}
+	}
+	return true
+}
+
 func main() {
 	core.InitConsole()
 	args := os.Args[1:]
@@ -128,7 +149,12 @@ func main() {
 	var targets []string
 	inputSource := input
 
-	// Check if input is file
+	if looksLikeFilePath(input) {
+		if st, err := os.Stat(input); err != nil || st.IsDir() {
+			printErrorAndExit(fmt.Sprintf("Input file not found: %s", input))
+		}
+	}
+
 	if _, err := os.Stat(input); err == nil {
 		content, err := os.ReadFile(input)
 		if err != nil {
