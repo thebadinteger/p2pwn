@@ -1008,6 +1008,9 @@ func resolveCached(hostport string) (*net.UDPAddr, error) {
 	defer dnsCancel()
 	ips, err := net.DefaultResolver.LookupIPAddr(dnsCtx, host)
 	if err != nil || len(ips) == 0 {
+		if addrs := CloudAddrs(hostport); len(addrs) > 0 {
+			return addrs[int(dnsRR.Add(1))%len(addrs)], nil
+		}
 		return nil, fmt.Errorf("dns lookup %s: %w", host, err)
 	}
 	addrs := make([]*net.UDPAddr, 0, len(ips))
@@ -1020,6 +1023,9 @@ func resolveCached(hostport string) (*net.UDPAddr, error) {
 		}
 	}
 	if len(addrs) == 0 {
+		if fb := CloudAddrs(hostport); len(fb) > 0 {
+			return fb[int(dnsRR.Add(1))%len(fb)], nil
+		}
 		return nil, fmt.Errorf("dns lookup %s: no addresses", host)
 	}
 	p := &dnsPool{addrs: addrs, expires: time.Now().Add(dnsPoolTTL)}
@@ -1027,6 +1033,8 @@ func resolveCached(hostport string) (*net.UDPAddr, error) {
 	i := p.next.Add(1)
 	return addrs[int(i)%len(addrs)], nil
 }
+
+var dnsRR atomic.Uint32
 
 type dnsPool struct {
 	addrs   []*net.UDPAddr

@@ -447,10 +447,20 @@ func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunne
 
 	if s.Config.Pwn.Snapshot && res != nil && res.Channels > 0 && res.Login != "" && res.Password != "" {
 		captured := false
-		for attempt := 0; attempt < 2; attempt++ {
-			if CaptureSnapshot(activeTunnel, res.Method, res.Login, res.Password, res.Channels, s.OutDir, serial, res.Model) {
+		for attempt := 0; attempt < 3; attempt++ {
+			ok, snapErr := CaptureSnapshot(activeTunnel, res.Method, res.Login, res.Password, res.Channels, s.OutDir, serial, res.Model)
+			if ok {
 				captured = true
 				break
+			}
+			if snapErr == nil || !isConnBreakErr(snapErr) || attempt == 2 {
+				break
+			}
+			if nt, _, ok := s.dialFreshTunnel(serial, res); ok && nt != nil {
+				if activeTunnel != nil {
+					activeTunnel.Disconnect()
+				}
+				activeTunnel = nt
 			}
 		}
 		if !captured {
@@ -767,7 +777,7 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 
 			snapshotOK := false
 			for snapshotAttempt := 0; snapshotAttempt < retries; snapshotAttempt++ {
-				if CaptureSnapshot(tunnel, method, login, password, channels, s.OutDir, serial, model) {
+				if ok, _ := CaptureSnapshot(tunnel, method, login, password, channels, s.OutDir, serial, model); ok {
 					snapshotOK = true
 					break
 				}

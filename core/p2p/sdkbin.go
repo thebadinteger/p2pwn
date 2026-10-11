@@ -109,25 +109,27 @@ func buildHashLoginPacket(user, hash string) []byte {
 	return buf
 }
 
+// accept both key: and key=
+func challengeField(text, key string) string {
+	for _, sep := range []string{key + ":", key + "="} {
+		idx := strings.Index(text, sep)
+		if idx < 0 {
+			continue
+		}
+		val := text[idx+len(sep):]
+		if end := strings.IndexAny(val, "\r\n"); end >= 0 {
+			val = val[:end]
+		}
+		if val = strings.TrimSpace(val); val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
 func parseChallengeBody(body []byte) (realm, random string) {
 	text := string(body)
-
-	realmPrefix := "Realm:"
-	if idx := strings.Index(text, realmPrefix); idx >= 0 {
-		afterRealm := text[idx+len(realmPrefix):]
-		if end := strings.Index(afterRealm, "\r\n"); end >= 0 {
-			realm = strings.TrimSpace(afterRealm[:end])
-		}
-	}
-
-	randomPrefix := "Random:"
-	if idx := strings.Index(text, randomPrefix); idx >= 0 {
-		afterRandom := text[idx+len(randomPrefix):]
-		if end := strings.Index(afterRandom, "\r\n"); end >= 0 {
-			random = strings.TrimSpace(afterRandom[:end])
-		}
-	}
-	return
+	return challengeField(text, "Realm"), challengeField(text, "Random")
 }
 
 func (s *SDKClient) loginWithHashNewRealm(challengeRealm, challengeRandom string) (uint32, error) {

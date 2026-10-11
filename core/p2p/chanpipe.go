@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	mrand "math/rand"
 	"net"
 	"sort"
 	"strconv"
@@ -16,25 +17,33 @@ import (
 )
 
 const (
-	pipeWindowStart    = 32
-	pipeWindowMin      = 8
-	pipeWindowMax      = 128
-	pipeWindowGrow     = 8
-	pipeWindowShrink   = 16
-	pipeAckTimeout     = 15 * time.Second
-	pipeAckGrace       = 15 * time.Second
-	pipeChannelRetries = 2
-	pipeMaxRPSDefault  = 3000
-	pipeBurst          = 64
-	pipeStartRPS       = 150
-	pipeFloorRPS       = 50
-	pipeTick           = 1000 * time.Millisecond
-	pipeSlowStartPct   = 3
-	pipeCaPct          = 15
-	pipeBackoffPct     = 15
-	pipeRTTRing        = 512
-	pipeWarmupWait     = 2 * time.Second
-	pipeTeardownAlive  = true
+	pipeWindowStart     = 32
+	pipeWindowMin       = 8
+	pipeWindowMax       = 256
+	pipeWindowGrow      = 8
+	pipeWindowShrink    = 16
+	pipeAckTimeout      = 15 * time.Second
+	pipeAckGrace        = 15 * time.Second
+	pipeTimeoutMin      = 2 * time.Second
+	pipeTimeoutRTTMul   = 10
+	pipeStormEMA        = 0.25
+	pipeSendJitterBound = 500 * time.Millisecond
+	pipeGraveCap        = 1024
+	pipePumpMaxWait     = 1 * time.Second
+	pipeChannelRetries  = 2
+	pipeMaxRPSDefault   = 3000
+	pipeBurst           = 64
+	pipeStartRPS        = 150
+	pipeFloorRPS        = 80
+	pipeTick            = 1000 * time.Millisecond
+	pipeSlowStartPct    = 3
+	pipeCaPct           = 15
+	pipeBackoffPct      = 20
+	pipeErrCount        = 5
+	pipeErrPct          = 8
+	pipeRTTRing         = 512
+	pipeWarmupWait      = 2 * time.Second
+	pipeTeardownAlive   = true
 )
 
 type PipeVerdict struct {
@@ -141,6 +150,8 @@ func (rl *pipeLimiter) setRPS(rps int) {
 var (
 	pipeMaxRPS        int64 = pipeMaxRPSDefault
 	pipeGovOn         int64 = 1
+	pipeTimeoutNs     atomic.Int64
+	pipeTimeoutAt     atomic.Int64
 	pipeGovPPS        int64 = pipeStartRPS
 	pipeGovSlow       int64 = 1
 	pipeGovHealthy    int64
@@ -167,6 +178,10 @@ func SetPipeGovernor(on bool) {
 	} else {
 		atomic.StoreInt64(&pipeGovOn, 0)
 	}
+}
+
+func init() {
+	pipeTimeoutNs.Store(int64(pipeAckTimeout))
 }
 
 func pipeResetGov() {
@@ -263,7 +278,7 @@ func pipeGovernorLoop() {
 		}
 
 		switch {
-		case (er >= 3 && er*100 >= total*5) || lossPct > float64(pipeBackoffPct):
+		case (er >= pipeErrCount && er*100 >= total*pipeErrPct) || lossPct > float64(pipeBackoffPct):
 			newPPS = pps / 2
 			atomic.StoreInt64(&pipeGovSlow, 0)
 			hard = true
@@ -445,6 +460,38 @@ func (p *checkPipeline) cancelled() bool {
 	}
 }
 
+func pipeCurTimeout() time.Duration {
+	now := time.Now()
+	if last := pipeTimeoutAt.Load(); now.Sub(time.Unix(0, last)) > time.Second {
+		if pipeTimeoutAt.CompareAndSwap(last, now.UnixNano()) {
+			to := int64(pipeAckTimeout)
+			if med := pipeMedianRTT(); med > 0 {
+				to = med * pipeTimeoutRTTMul
+				if to < int64(pipeTimeoutMin) {
+					to = int64(pipeTimeoutMin)
+				}
+				if to > int64(pipeAckTimeout) {
+					to = int64(pipeAckTimeout)
+				}
+			}
+			pipeTimeoutNs.Store(to)
+		}
+	}
+	return time.Duration(pipeTimeoutNs.Load())
+}
+
+// spread deadlines of a burst so retries do not fire as a herd
+func pipeSendJitter() time.Duration {
+	if pipeSendJitterBound <= 0 {
+		return 0
+	}
+	return time.Duration(mrand.Int63n(int64(pipeSendJitterBound)))
+}
+
+func (p *checkPipeline) stormMode() bool {
+	return p.emaSet && p.expiredEMA > pipeStormEMA
+}
+
 func (p *checkPipeline) send(serial string) bool {
 	cseq := SmartPSSProfile.nextCSeq()
 	aid := make([]byte, 8)
@@ -459,7 +506,7 @@ func (p *checkPipeline) send(serial string) bool {
 		pipeRecordErr()
 		return false
 	}
-	p.inflight[cseq] = &pipeInflight{serial: serial, aid: aid, deadline: time.Now().Add(p.timeout), sentAt: time.Now()}
+	p.inflight[cseq] = &pipeInflight{serial: serial, aid: aid, deadline: time.Now().Add(pipeCurTimeout() + pipeSendJitter()), sentAt: time.Now()}
 	return true
 }
 
@@ -673,19 +720,48 @@ func (p *checkPipeline) teardown(aid []byte, resp *DHResponse) {
 	}
 }
 
+func (p *checkPipeline) gravePut(c uint32, g *pipeGrave) {
+	if len(p.graveyard) >= pipeGraveCap {
+		var oldC uint32
+		var oldD time.Time
+		first := true
+		for cc, gg := range p.graveyard {
+			if first || gg.deadline.Before(oldD) {
+				oldC, oldD, first = cc, gg.deadline, false
+			}
+		}
+		if !first {
+			og := p.graveyard[oldC]
+			delete(p.graveyard, oldC)
+			p.emit(og.serial, false)
+		}
+	}
+	p.graveyard[c] = g
+}
+
 func (p *checkPipeline) expire() {
 	now := time.Now()
+	storm := p.stormMode()
 	for c, ir := range p.inflight {
 		if now.After(ir.deadline) {
 			delete(p.inflight, c)
 			p.expiredCycle++
 			pipeRecordTO()
-			p.graveyard[c] = &pipeGrave{serial: ir.serial, aid: ir.aid, retries: ir.retries, deadline: now.Add(p.grace)}
+			if storm {
+				p.emit(ir.serial, false)
+				continue
+			}
+			p.gravePut(c, &pipeGrave{serial: ir.serial, aid: ir.aid, retries: ir.retries, deadline: now.Add(p.grace)})
 		}
 	}
 	for c, g := range p.graveyard {
 		if now.After(g.deadline) {
 			if g.retries >= pipeChannelRetries {
+				delete(p.graveyard, c)
+				p.emit(g.serial, false)
+				continue
+			}
+			if storm {
 				delete(p.graveyard, c)
 				p.emit(g.serial, false)
 				continue
@@ -715,7 +791,7 @@ func (p *checkPipeline) sendRetry(g *pipeGrave) {
 		p.emit(g.serial, false)
 		return
 	}
-	p.inflight[cseq] = &pipeInflight{serial: g.serial, aid: aid, deadline: time.Now().Add(p.timeout), retries: g.retries + 1, sentAt: time.Now()}
+	p.inflight[cseq] = &pipeInflight{serial: g.serial, aid: aid, deadline: time.Now().Add(pipeCurTimeout() + pipeSendJitter()), retries: g.retries + 1, sentAt: time.Now()}
 }
 
 func (p *checkPipeline) govern() {
@@ -746,6 +822,9 @@ func (p *checkPipeline) govern() {
 func (p *checkPipeline) pump(maxWait time.Duration) {
 	dl := p.minDeadline()
 	wait := time.Until(dl)
+	if wait > pipePumpMaxWait {
+		wait = pipePumpMaxWait
+	}
 	if maxWait > 0 && maxWait < wait {
 		wait = maxWait
 	}
@@ -880,6 +959,7 @@ func NewCheckPipe(workers int, done <-chan struct{}, maxRPS int, governorOn bool
 		c.wg.Add(1)
 		go func(w *checkPipeline) {
 			defer c.wg.Done()
+			defer pipeCrashGuard()
 			w.warmup()
 			w.run(c.jobs)
 		}(w)
