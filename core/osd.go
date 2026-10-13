@@ -339,7 +339,10 @@ func newRPC2Session(tunnel *p2p.PTCPTunnel, login, pass string) (*osdSession, er
 		setBoth: func(ctOut, vwOut []any) error {
 			return rpc2MulticallSet(conn, sess, cookie, ctOut, vwOut)
 		},
-		close: closeConn,
+		conn:   conn,
+		sess:   sess,
+		cookie: cookie,
+		close:  closeConn,
 	}, nil
 }
 
@@ -377,6 +380,9 @@ type osdSession struct {
 	get     func(name string, id int) (*cfgData, error)
 	setBoth func(ctOut, vwOut []any) error
 	close   func()
+	conn    *rpc2ConnSession
+	sess    any
+	cookie  string
 }
 
 func checkMulticallResult(r map[string]any) error {

@@ -23,7 +23,20 @@ type ScanConfig struct {
 type PwnConfig struct {
 	Protocol map[string]bool `toml:"protocol"`
 	Methods  map[string]bool `toml:"methods"`
-	Snapshot bool            `toml:"snapshot"`
+}
+
+type ImageConfig struct {
+	Snapshot bool `toml:"snapshot"`
+	Rtsp     bool `toml:"rtsp"`
+	Cgi      bool `toml:"cgi"`
+	Sdk      bool `toml:"sdk"`
+}
+
+// experimental do not use
+type NukeConfig struct {
+	Delete bool        `toml:"delete"`
+	Video  interface{} `toml:"video"`
+	Box    bool        `toml:"box"`
 }
 
 type Credential struct {
@@ -55,6 +68,8 @@ type OverlayConfig struct {
 type Config struct {
 	Scan    ScanConfig    `toml:"scan"`
 	Pwn     PwnConfig     `toml:"pwn"`
+	Image   ImageConfig   `toml:"image"`
+	Nuke    NukeConfig    `toml:"nuke"`
 	Brute   BruteConfig   `toml:"brute"`
 	Dummy   DummyConfig   `toml:"dummy"`
 	Overlay OverlayConfig `toml:"overlay"`
@@ -70,7 +85,6 @@ governor = true # Enable/disable governor
 maxrps = 3000 # Cap on concurrent online/offline checks
 
 [pwn] # Usage of different protocols and methods
-snapshot = true # Take snapshots
 protocol.cgi = true # Web CGI protocol
 protocol.sdk = true # 37777 SDK protocol
 protocol.type1 = true # Type 1 protocol
@@ -78,6 +92,12 @@ methods.brute = true # Credentials bruteforce
 methods.cve-2021-33044 = true # CVE-2021-33044
 methods.cve-2021-33045 = true # CVE-2021-33045
 methods.uau = true # Unauthenticated addUser
+
+[image]
+snapshot = true # Take snapshots
+rtsp = true # Take snapshots with RTSP
+cgi = true # Take snapshots with CGI
+sdk = true # Take snapshots with SDK
 
 [brute] # Bruteforce configuration
 type1.delay = 20 # Type 1 brute attempts delay in seconds
@@ -242,6 +262,10 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 
 	if len(conf.Overlay.Custom) > 5 {
 		return nil, fmt.Errorf("invalid overlay custom value in config (up to 5 lines)")
+	}
+
+	if !conf.Image.Rtsp && !conf.Image.Cgi && !conf.Image.Sdk {
+		return nil, fmt.Errorf("at least one of rtsp cgi or sdk must be enabled in config")
 	}
 
 	creds, err := resolveCredentials(conf.Brute.Credentials, path)

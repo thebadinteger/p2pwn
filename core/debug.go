@@ -248,6 +248,39 @@ func LogBruteCheckResult(serial string, proto string, user string, pass string, 
 	}
 }
 
+func LogNukeResult(serial string, op string, success bool, err error) {
+	if !globalDebug.enabled {
+		return
+	}
+	if success {
+		DebugLogf("nuke", "%s > %s", serial, op)
+	} else {
+		DebugLogf("nuke", "%s > %s failed: %v", serial, op, err)
+	}
+}
+
+func LogCredsLogin(serial string, login string, type1 bool) {
+	if !globalDebug.enabled {
+		return
+	}
+	if type1 {
+		DebugLogf("creds", "%s > login ok from input (user=%s, type 1)", serial, login)
+	} else {
+		DebugLogf("creds", "%s > login ok from input (user=%s, type 0)", serial, login)
+	}
+}
+
+func LogCredsFail(serial string, login string, type1 bool, attempt int, err error) {
+	if !globalDebug.enabled {
+		return
+	}
+	mode := 0
+	if type1 {
+		mode = 1
+	}
+	DebugLogf("creds", "%s > login from input failed (user=%s, type %d, attempt %d): %v", serial, login, mode, attempt, err)
+}
+
 func LogScanFinish(completed int64, pwned int64, online int64, waste int64, total int64) {
 	if !globalDebug.enabled {
 		return

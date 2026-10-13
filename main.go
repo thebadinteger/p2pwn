@@ -104,6 +104,7 @@ func main() {
 	threads := 100
 	configPath := "config.toml"
 	debugEnabled := false
+	nukeEnabled := false
 	showHelp := false
 
 	for i := 0; i < len(args); i++ {
@@ -131,6 +132,8 @@ func main() {
 			}
 		case "-d", "--debug":
 			debugEnabled = true
+		case "-n", "--nuke":
+			nukeEnabled = true
 		case "-h", "-?", "--help":
 			showHelp = true
 		}
@@ -147,7 +150,20 @@ func main() {
 
 	// Parse input
 	var targets []string
+	var provided []core.ProvidedCred
 	inputSource := input
+
+	addToken := func(tok string) {
+		if tok == "" {
+			return
+		}
+		if c, ok := core.ParseCredToken(tok); ok {
+			provided = append(provided, c)
+			targets = append(targets, c.Serial)
+			return
+		}
+		targets = append(targets, tok)
+	}
 
 	if looksLikeFilePath(input) {
 		if st, err := os.Stat(input); err != nil || st.IsDir() {
@@ -172,19 +188,13 @@ func main() {
 				continue
 			}
 			for _, part := range strings.Split(line, ",") {
-				part = strings.TrimSpace(part)
-				if part != "" {
-					targets = append(targets, part)
-				}
+				addToken(strings.TrimSpace(part))
 			}
 		}
 	} else {
 		// Treat input as comma-separated targets
 		for _, part := range strings.Split(input, ",") {
-			part = strings.TrimSpace(part)
-			if part != "" {
-				targets = append(targets, part)
-			}
+			addToken(strings.TrimSpace(part))
 		}
 	}
 
@@ -226,6 +236,6 @@ func main() {
 	defer core.CloseDebug()
 
 	// Run scanner
-	scanner := core.NewScanner(targets, cfg, threads, output, inputSource)
+	scanner := core.NewScanner(targets, cfg, threads, output, inputSource, nukeEnabled, provided)
 	scanner.Run()
 }

