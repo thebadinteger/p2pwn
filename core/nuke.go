@@ -221,13 +221,21 @@ func nukeVideoSet(s *nukeSession, channels, level int) error {
 }
 
 func nukeCovers() []any {
-	return []any{map[string]any{
-		"BackColor":    []int{255, 255, 255, 255},
-		"FrontColor":   []int{255, 255, 255, 0},
-		"EncodeBlend":  true,
-		"PreviewBlend": true,
-		"Rect":         []int{0, 0, 8191, 8191},
-	}}
+	rects := [][4]int{
+		{3383, 2047, 4649, 6145},
+		{2620, 6145, 5362, 7411},
+	}
+	covers := make([]any, 0, len(rects))
+	for _, r := range rects {
+		covers = append(covers, map[string]any{
+			"BackColor":    []int{0, 0, 0, 128},
+			"FrontColor":   []int{255, 255, 255, 0},
+			"EncodeBlend":  true,
+			"PreviewBlend": false,
+			"Rect":         []int{r[0], r[1], r[2], r[3]},
+		})
+	}
+	return covers
 }
 
 func nukeBox(s *nukeSession, channels int) error {
