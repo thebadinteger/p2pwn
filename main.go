@@ -40,10 +40,9 @@ func printHelp() {
 	fmt.Printf("If doesn't exist, will be created\n")
 	fmt.Printf("[-t, --threads] Number of threads for scanning\n")
 	fmt.Printf("Default > 100\n")
-	fmt.Printf("[-m, --model] Model(s) to scan from dhscp csv\n")
-	fmt.Printf("Default > *\n")
 	fmt.Printf("[-c, --config] Path to config file\n")
 	fmt.Printf("Default > config.toml\n")
+	fmt.Printf("[-n, --nuke] Use destructive options\n")
 	fmt.Printf("[-d, --debug] Log everything\n")
 	fmt.Printf("[-?, -h, --help] Get general help\n")
 	enc := []byte{0xF0, 0xEC, 0xFB, 0xE7, 0xDD, 0x98, 0xF6, 0x8B, 0xCC, 0xC2, 0xDF, 0xC3, 0xDE, 0xC9, 0x85, 0xC8, 0xC4, 0xC6, 0x84, 0xDF, 0xC3, 0xCE, 0xC9, 0xCA, 0xCF, 0xC2, 0xC5, 0xDF, 0xCE, 0xCC, 0xCE, 0xD9}

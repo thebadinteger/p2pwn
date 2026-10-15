@@ -17,9 +17,9 @@ methods.uau = true # Unauthenticated addUser
 
 [image]
 snapshot = true # Take snapshots
-rtsp = true # Take snapshots with RTSP
 cgi = true # Take snapshots with CGI
 sdk = true # Take snapshots with SDK
+rtsp = true # Take snapshots with RTSP
 
 [brute] # Bruteforce configuration
 type1.delay = 20 # Type 1 brute attempts delay in seconds
@@ -34,6 +34,7 @@ credentials = [
 [dummy] # Credentials for added dummy account
 login = "p2pwn" # 5-32 alphanumeric characters
 password = "p2password" # 8-32 alphanumeric characters
+memo = "p2pwn" # Account note up to 32 characters
 
 [overlay] # Custom overlay configuration
 osd = false # Set OSD on pwned devices
@@ -42,3 +43,15 @@ custom = [
   "p2pwned",
   "device is vulnerable"
 ] # CustomTitle (up to 5 lines, max 22 char per line)
+color.front = [255, 255, 255, 255] # OSD front color R G B A (0-255)
+color.back = [0, 0, 0, 128] # OSD back color R G B A (0-255)
+
+[nuke] # Experimental destructive options
+delete = false # Delete all accounts except admin and dummy
+video = 50 # Set all video settings to specified number (0-100)
+box = false # Add box masks
+coordinates.box = [
+  [3383, 2047, 4649, 6245],
+  [2620, 6145, 5362, 7411]
+] # Box masks x1 y1 x2 y2 (up to 5 boxes)
+disable = false # Disable P2P on the device when done

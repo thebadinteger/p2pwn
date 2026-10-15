@@ -281,6 +281,20 @@ func LogCredsFail(serial string, login string, type1 bool, attempt int, err erro
 	DebugLogf("creds", "%s > login from input failed (user=%s, type %d, attempt %d): %v", serial, login, mode, attempt, err)
 }
 
+func LogCredsVerify(serial string, login string, via string, err error) {
+	if !globalDebug.enabled {
+		return
+	}
+	DebugLogf("creds", "%s > verify from input failed (user=%s, via %s): %v", serial, login, via, err)
+}
+
+func LogCredsLocked(serial string, until time.Time) {
+	if !globalDebug.enabled {
+		return
+	}
+	DebugLogf("creds", "%s > account locked until %s skipping auth", serial, until.Format("15:04:05"))
+}
+
 func LogScanFinish(completed int64, pwned int64, online int64, waste int64, total int64) {
 	if !globalDebug.enabled {
 		return

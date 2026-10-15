@@ -46,7 +46,6 @@ func parseCamPorts(blobFields, topFields map[string]string) (http, priv, rtsp in
 	return atoiPort(merged["httpport"]), atoiPort(merged["privport"]), atoiPort(merged["rtspport"])
 }
 
-// cache blob ports per serial. called on every handshake
 func rememberCamPorts(serial string, http, priv, rtsp int) {
 	if serial == "" {
 		return
@@ -56,7 +55,6 @@ func rememberCamPorts(serial string, http, priv, rtsp int) {
 	camPortsMu.Unlock()
 }
 
-// return known camera ports for a serial (0 = unknown = default)
 func CamPorts(serial string) (http, priv, rtsp int) {
 	camPortsMu.RLock()
 	p, ok := camPortsBySerial[serial]
@@ -67,7 +65,6 @@ func CamPorts(serial string) (http, priv, rtsp int) {
 	return p.http, p.priv, p.rtsp
 }
 
-// try-port lists: default first, blob custom second (deduped)
 func HTTPTryPorts(serial string) []int {
 	return tryPorts(DefaultHTTPPort, camPortHTTP(serial))
 }

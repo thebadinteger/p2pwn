@@ -878,6 +878,7 @@ func (c *DHIPClient) LoginNormal(user, pass string) error {
 		return nil
 	}
 	raw, _ := json.Marshal(r2)
+	noteLockFromResp(c.tunnel, r2)
 	return fmt.Errorf("dhip normal login rejected resp=%s", string(raw))
 }
 
@@ -1560,6 +1561,10 @@ func ExtractJPEG(resp []byte) ([]byte, bool) {
 	}
 
 	// two-phase hunt
+	return HuntBestJPEG(body)
+}
+
+func HuntBestJPEG(body []byte) ([]byte, bool) {
 	var best []byte
 	var fallback []byte
 	off := 0
@@ -1611,7 +1616,7 @@ func ExtractJPEG(resp []byte) ([]byte, bool) {
 	return nil, false
 }
 
-// reports whether bs parses as a whole JPEG
+// report whether bs parses as a whole JPEG
 func decodableJPEG(bs []byte) bool {
 	_, err := jpeg.Decode(bytes.NewReader(bs))
 	return err == nil

@@ -33,10 +33,17 @@ type ImageConfig struct {
 }
 
 // experimental do not use
+type NukeCoordsConfig struct {
+	Box interface{} `toml:"box"`
+}
+
 type NukeConfig struct {
-	Delete bool        `toml:"delete"`
-	Video  interface{} `toml:"video"`
-	Box    bool        `toml:"box"`
+	Delete      bool             `toml:"delete"`
+	Video       interface{}      `toml:"video"`
+	Box         bool             `toml:"box"`
+	Coordinates NukeCoordsConfig `toml:"coordinates"`
+	BoxRects    [][4]int         `toml:"-"`
+	Disable     bool             `toml:"disable"`
 }
 
 type Credential struct {
@@ -57,12 +64,19 @@ type BruteConfig struct {
 type DummyConfig struct {
 	Login    string `toml:"login"`
 	Password string `toml:"password"`
+	Memo     string `toml:"memo"`
+}
+
+type OverlayColorConfig struct {
+	Front []int `toml:"front"`
+	Back  []int `toml:"back"`
 }
 
 type OverlayConfig struct {
-	Osd     bool     `toml:"osd"`
-	Channel string   `toml:"channel"`
-	Custom  []string `toml:"custom"`
+	Osd     bool               `toml:"osd"`
+	Channel string             `toml:"channel"`
+	Color   OverlayColorConfig `toml:"color"`
+	Custom  []string           `toml:"custom"`
 }
 
 type Config struct {
@@ -95,9 +109,9 @@ methods.uau = true # Unauthenticated addUser
 
 [image]
 snapshot = true # Take snapshots
-rtsp = true # Take snapshots with RTSP
 cgi = true # Take snapshots with CGI
 sdk = true # Take snapshots with SDK
+rtsp = true # Take snapshots with RTSP
 
 [brute] # Bruteforce configuration
 type1.delay = 20 # Type 1 brute attempts delay in seconds
@@ -112,6 +126,7 @@ credentials = [
 [dummy] # Credentials for added dummy account
 login = "p2pwn" # 5-32 alphanumeric characters
 password = "p2password" # 8-32 alphanumeric characters
+memo = "p2pwn" # Account note up to 32 characters
 
 [overlay] # Custom overlay configuration
 osd = false # Set OSD on pwned devices
@@ -120,6 +135,18 @@ custom = [
   "p2pwned",
   "device is vulnerable"
 ] # CustomTitle (up to 5 lines, max 22 char per line)
+color.front = [255, 255, 255, 255] # OSD front color R G B A (0-255)
+color.back = [0, 0, 0, 128] # OSD back color R G B A (0-255)
+
+[nuke] # Experimental destructive options
+delete = false # Delete all accounts except admin and dummy
+video = 50 # Set all video settings to specified number (0-100)
+box = false # Add box masks
+coordinates.box = [
+  [3383, 2047, 4649, 6245],
+  [2620, 6145, 5362, 7411]
+] # Box masks x1 y1 x2 y2 (up to 5 boxes)
+disable = false # Disable P2P on the device when done
 `
 
 type Range struct {
@@ -264,6 +291,21 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 		return nil, fmt.Errorf("invalid overlay custom value in config (up to 5 lines)")
 	}
 
+	if len(conf.Dummy.Memo) > 32 {
+		return nil, fmt.Errorf("invalid dummy memo format in config (up to 32 characters)")
+	}
+
+	if conf.Overlay.Color.Front, err = parseRGBA(conf.Overlay.Color.Front, "color.front", defaultRGBAFront); err != nil {
+		return nil, err
+	}
+	if conf.Overlay.Color.Back, err = parseRGBA(conf.Overlay.Color.Back, "color.back", defaultRGBABack); err != nil {
+		return nil, err
+	}
+
+	if conf.Nuke.BoxRects, err = parseBoxCoords(conf.Nuke.Coordinates.Box); err != nil {
+		return nil, err
+	}
+
 	if !conf.Image.Rtsp && !conf.Image.Cgi && !conf.Image.Sdk {
 		return nil, fmt.Errorf("at least one of rtsp cgi or sdk must be enabled in config")
 	}
@@ -278,7 +320,6 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 	return &conf, nil
 }
 
-// credentials may be an inline list or a path to a login:password wordlist
 func resolveCredentials(v interface{}, configPath string) ([]Credential, error) {
 	switch val := v.(type) {
 	case nil:
@@ -319,7 +360,6 @@ func credsFromTables(tables []map[string]interface{}) ([]Credential, error) {
 	return out, nil
 }
 
-// comments skipped
 func loadWordlist(listPath, configPath string) ([]Credential, error) {
 	raw, err := os.ReadFile(listPath)
 	if err != nil && configPath != "" {
@@ -348,6 +388,58 @@ func loadWordlist(listPath, configPath string) ([]Credential, error) {
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("credentials wordlist has no usable entries")
+	}
+	return out, nil
+}
+
+var defaultRGBAFront = []int{255, 255, 255, 255}
+var defaultRGBABack = []int{0, 0, 0, 128}
+
+var defaultBoxRects = [][4]int{
+	{3383, 2047, 4649, 6245},
+	{2620, 6145, 5362, 7411},
+}
+
+func parseRGBA(v []int, name string, def []int) ([]int, error) {
+	if v == nil {
+		return append([]int(nil), def...), nil
+	}
+	if len(v) != 4 {
+		return nil, fmt.Errorf("invalid overlay %s value in config (4 numbers 0-255)", name)
+	}
+	out := make([]int, 4)
+	for i, n := range v {
+		if n < 0 || n > 255 {
+			return nil, fmt.Errorf("invalid overlay %s value in config (4 numbers 0-255)", name)
+		}
+		out[i] = n
+	}
+	return out, nil
+}
+
+func parseBoxCoords(v interface{}) ([][4]int, error) {
+	if v == nil {
+		return append([][4]int(nil), defaultBoxRects...), nil
+	}
+	arr, ok := v.([]interface{})
+	if !ok || len(arr) == 0 || len(arr) > 5 {
+		return nil, fmt.Errorf("invalid nuke coordinates.box value in config (up to 5 rects of 4 numbers)")
+	}
+	out := make([][4]int, 0, len(arr))
+	for _, raw := range arr {
+		inner, ok := raw.([]interface{})
+		if !ok || len(inner) != 4 {
+			return nil, fmt.Errorf("invalid nuke coordinates.box value in config (up to 5 rects of 4 numbers)")
+		}
+		var r [4]int
+		for i, n := range inner {
+			val, err := getIntValue(n)
+			if err != nil {
+				return nil, fmt.Errorf("invalid nuke coordinates.box value in config (up to 5 rects of 4 numbers)")
+			}
+			r[i] = val
+		}
+		out = append(out, r)
 	}
 	return out, nil
 }

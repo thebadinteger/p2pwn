@@ -859,7 +859,6 @@ func (c *DHClient) CompleteRelayHandshake() error {
 			}
 			c.ptcpSession.Receive(pkt)
 			if isSYNBody(pkt.Body) || (len(pkt.Body) == 4 && pkt.Body[0] == 0x00) {
-				// Received SYN-ACK. send ACK then a heartbeat
 				ackPkt := c.ptcpSession.Send([]byte{})
 				c.sendTo(agentConn, c.agentAddr, ackPkt.Serialize())
 

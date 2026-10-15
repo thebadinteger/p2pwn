@@ -49,7 +49,6 @@ type cloudPool struct {
 var (
 	cloudMu      sync.Mutex
 	cloudCached  *cloudPool
-	cloudRR      atomic.Uint32
 	cloudFromDNS atomic.Bool
 )
 
@@ -145,12 +144,4 @@ func CloudAddrs(hostport string) []*net.UDPAddr {
 		go cloudRehydrate(hostport)
 	}
 	return fallback
-}
-
-func CloudNext(hostport string) *net.UDPAddr {
-	addrs := CloudAddrs(hostport)
-	if len(addrs) == 0 {
-		return nil
-	}
-	return addrs[int(cloudRR.Add(1))%len(addrs)]
 }

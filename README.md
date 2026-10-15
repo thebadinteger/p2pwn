@@ -42,13 +42,14 @@ Or download the latest binary from the **[Releases page](https://github.com/theb
 
 ## Usage:  
 ```shell
-./p2pwn -i [input] -o [output] -t [threads] (-c [config])
+./p2pwn -i [input] -o [output] -t [threads] (-c [config]) (--nuke) (--debug)
 ```  
 ```
 [-i, --input] Input file or specific target(s)
 Format:
 XXXXXXXXXX > Prefix
 XXXXXXXXXXYYYYY > S/N
+model,prefix > dhscp
 [-o, --output] Output folder for results
 Default > DD-MM-YYYY_HH-MM-SS
 If doesn't exist, will be created
@@ -56,6 +57,7 @@ If doesn't exist, will be created
 Default > 100
 [-c, --config] Path to config file
 Default > config.toml
+[-n, --nuke] Use destructive options
 [-d, --debug] Log everything
 [-?, -h, --help] Get general help
 ```  
@@ -113,9 +115,9 @@ methods.uau = true # Unauthenticated addUser
 
 [image]
 snapshot = true # Take snapshots
-rtsp = true # Take snapshots with RTSP
 cgi = true # Take snapshots with CGI
 sdk = true # Take snapshots with SDK
+rtsp = true # Take snapshots with RTSP
 
 [brute] # Bruteforce configuration
 type1.delay = 20 # Type 1 brute attempts delay in seconds
@@ -130,6 +132,7 @@ credentials = [
 [dummy] # Credentials for added dummy account
 login = "p2pwn" # 5-32 alphanumeric characters
 password = "p2password" # 8-32 alphanumeric characters
+memo = "p2pwn" # Account note up to 32 characters
 
 [overlay] # Custom overlay configuration
 osd = false # Set OSD on pwned devices
@@ -138,6 +141,18 @@ custom = [
   "p2pwned",
   "device is vulnerable"
 ] # CustomTitle (up to 5 lines, max 22 char per line)
+color.front = [255, 255, 255, 255] # OSD front color R G B A (0-255)
+color.back = [0, 0, 0, 128] # OSD back color R G B A (0-255)
+
+[nuke] # Experimental destructive options
+delete = false # Delete all accounts except admin and dummy
+video = 50 # Set all video settings to specified number (0-100)
+box = false # Add box masks
+coordinates.box = [
+  [3383, 2047, 4649, 6245],
+  [2620, 6145, 5362, 7411]
+] # Box masks x1 y1 x2 y2 (up to 5 boxes)
+disable = false # Disable P2P on the device when done
 ```  
 Tips:  
 - `nurses` - The higher, the faster the S/N check (online/offline), but more packets
@@ -152,6 +167,7 @@ Tips:
 - `type1.delay` - Type 1 brute attempts delay in seconds (not recommended to change)
 - `channel` - Custom channel title for OSD overlay (leave empty to not change)
 - `custom` - Custom OSD overlay text (leave empty to not change)
+- `[nuke]` - Experimental destructive options, DO NOT USE (only works with --nuke flag specified)
 
 ## Credits  
 Made by [badinteger](https://github.com/thebadinteger) `[GPL v3.0 License]`  

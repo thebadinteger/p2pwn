@@ -408,8 +408,6 @@ func isUDPHardError(err error) bool {
 		strings.Contains(s, "broken pipe")
 }
 
-// a connected udp socket poisoned by icmp unreachable errors on every
-// read forever redial gives the worker a clean one
 func (p *checkPipeline) reconnect() {
 	if time.Since(p.lastReconnect) < time.Second {
 		return
@@ -480,7 +478,6 @@ func pipeCurTimeout() time.Duration {
 	return time.Duration(pipeTimeoutNs.Load())
 }
 
-// spread deadlines of a burst so retries do not fire as a herd
 func pipeSendJitter() time.Duration {
 	if pipeSendJitterBound <= 0 {
 		return 0
