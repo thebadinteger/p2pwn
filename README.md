@@ -50,6 +50,7 @@ Format:
 XXXXXXXXXX > Prefix
 XXXXXXXXXXYYYYY > S/N
 model,prefix > dhscp
+others > csv,xml,folders
 [-o, --output] Output folder for results
 Default > DD-MM-YYYY_HH-MM-SS
 If doesn't exist, will be created
@@ -60,6 +61,7 @@ Default > config.toml
 [-n, --nuke] Use destructive options
 [-d, --debug] Log everything
 [-?, -h, --help] Get general help
+[GPLv3] github.com/thebadinteger
 ```  
 
 **Input format:**  
