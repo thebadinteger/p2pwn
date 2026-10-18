@@ -10,6 +10,8 @@ github.com/thebadinteger/rtsnap v0.4.1 h1:HtVmNYnogA33wbwfimOt4nqt5F0hXfAfBJme1Y
 github.com/thebadinteger/rtsnap v0.4.1/go.mod h1:L/EE8LOwZTEZ2wYRXlRgMqNVFqbne/Rftg+C81uEAog=
 github.com/thebadinteger/rtsnap v0.4.2 h1:CoM6xgsZwtGCESvtW1LZrt3/EHCL7I210erf4YzjcmQ=
 github.com/thebadinteger/rtsnap v0.4.2/go.mod h1:L/EE8LOwZTEZ2wYRXlRgMqNVFqbne/Rftg+C81uEAog=
+github.com/thebadinteger/rtsnap v0.4.3 h1:MHniOPihIF7czvF5ovEAhn/snrDzfJp56TpCAqz1IaM=
+github.com/thebadinteger/rtsnap v0.4.3/go.mod h1:L/EE8LOwZTEZ2wYRXlRgMqNVFqbne/Rftg+C81uEAog=
 golang.org/x/crypto v0.57.0 h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=
 golang.org/x/crypto v0.57.0/go.mod h1:Fdz0i5U6CoizGwLda9DttjSk6qlZo25zYNtR+ycvuZA=
 golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -35,6 +34,7 @@ func printHelp() {
 	fmt.Printf("XXXXXXXXXX > Prefix\n")
 	fmt.Printf("XXXXXXXXXXYYYYY > S/N\n")
 	fmt.Printf("model,prefix > dhscp\n")
+	fmt.Printf("others > csv,xml,folders\n")
 	fmt.Printf("[-o, --output] Output folder for results\n")
 	fmt.Printf("Default > DD-MM-YYYY_HH-MM-SS\n")
 	fmt.Printf("If doesn't exist, will be created\n")
@@ -66,27 +66,6 @@ func isDirReadOnly(dir string) bool {
 	f.Close()
 	os.Remove(tmpFile)
 	return false
-}
-
-func looksLikeFilePath(input string) bool {
-	if strings.ContainsAny(input, `/\`) {
-		return true
-	}
-	dot := strings.LastIndex(input, ".")
-	if dot <= 0 || dot == len(input)-1 {
-		return false
-	}
-	ext := input[dot+1:]
-	if len(ext) > 5 {
-		return false
-	}
-	for _, r := range ext {
-		isAlnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
-		if !isAlnum {
-			return false
-		}
-	}
-	return true
 }
 
 func main() {
@@ -148,69 +127,12 @@ func main() {
 	}
 
 	// Parse input
-	var targets []string
-	var provided []core.ProvidedCred
 	inputSource := input
 
-	addToken := func(tok string) {
-		if tok == "" {
-			return
-		}
-		if c, ok := core.ParseCredToken(tok); ok {
-			provided = append(provided, c)
-			targets = append(targets, c.Serial)
-			return
-		}
-		targets = append(targets, tok)
+	targets, provided, err := core.LoadInput(input)
+	if err != nil {
+		printErrorAndExit(err.Error())
 	}
-
-	if looksLikeFilePath(input) {
-		if st, err := os.Stat(input); err != nil || st.IsDir() {
-			printErrorAndExit(fmt.Sprintf("Input file not found: %s", input))
-		}
-	}
-
-	if _, err := os.Stat(input); err == nil {
-		content, err := os.ReadFile(input)
-		if err != nil {
-			printErrorAndExit(fmt.Sprintf("Cannot read input file: %s", err))
-		}
-		trimmed := strings.TrimSpace(string(content))
-		if trimmed == "" {
-			printErrorAndExit("Empty input")
-		}
-
-		// Split by lines and commas
-		for _, line := range strings.Split(trimmed, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			for _, part := range strings.Split(line, ",") {
-				addToken(strings.TrimSpace(part))
-			}
-		}
-	} else {
-		// Treat input as comma-separated targets
-		for _, part := range strings.Split(input, ",") {
-			addToken(strings.TrimSpace(part))
-		}
-	}
-
-	if len(targets) == 0 {
-		printErrorAndExit("Empty input")
-	}
-
-	seen := make(map[string]struct{}, len(targets))
-	uniq := make([]string, 0, len(targets))
-	for _, t := range targets {
-		if _, ok := seen[t]; ok {
-			continue
-		}
-		seen[t] = struct{}{}
-		uniq = append(uniq, t)
-	}
-	targets = uniq
 
 	// Determine output dir
 	if output == "" {

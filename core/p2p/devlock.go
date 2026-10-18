@@ -1,8 +1,8 @@
 package p2p
 
 import (
+	"encoding/json"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 )
@@ -82,19 +82,16 @@ func LockedSecondsText(text string) (int, bool) {
 	return sec, true
 }
 
-func LockedWord(text string) bool {
-	s := strings.ToLower(text)
-	for _, w := range []string{"account locked", "user locked", "locked, try", "remainlock", "remainlogintimes", "lockout"} {
-		if strings.Contains(s, w) {
-			return true
-		}
-	}
-	return false
-}
-
 func noteLockFromResp(tunnel *PTCPTunnel, resp map[string]any) {
 	sec, ok := ParseLockSeconds(resp)
 	if !ok {
+		if raw, err := json.Marshal(resp); err == nil {
+			if s, found := LockedSecondsText(string(raw)); found {
+				sec = s
+			}
+		}
+	}
+	if sec <= 0 {
 		return
 	}
 	serial := ""

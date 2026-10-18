@@ -1566,7 +1566,6 @@ func ExtractJPEG(resp []byte) ([]byte, bool) {
 
 func HuntBestJPEG(body []byte) ([]byte, bool) {
 	var best []byte
-	var fallback []byte
 	off := 0
 	for scanned := 0; off+1 < len(body) && scanned < jpegHuntMaxSOI; {
 		rel := bytes.Index(body[off:], []byte{0xFF, 0xD8})
@@ -1595,9 +1594,6 @@ func HuntBestJPEG(body []byte) ([]byte, bool) {
 			if len(candidate) < 1000 {
 				continue
 			}
-			if fallback == nil && StructurallyValidJPEG(candidate) {
-				fallback = candidate
-			}
 			if decodableJPEG(candidate) {
 				if len(candidate) > len(best) {
 					best = candidate
@@ -1609,9 +1605,6 @@ func HuntBestJPEG(body []byte) ([]byte, bool) {
 
 	if best != nil {
 		return best, true
-	}
-	if fallback != nil {
-		return fallback, true
 	}
 	return nil, false
 }

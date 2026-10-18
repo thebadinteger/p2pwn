@@ -507,8 +507,9 @@ func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 		}
 
 		if hint, has := s.credHint(serial); has {
-			s.useProvidedCreds(serial, client, tunnel, directOK, hint, cleanup)
-			return
+			if s.useProvidedCreds(serial, client, tunnel, directOK, hint, cleanup) {
+				return
+			}
 		}
 
 		pwned := s.processExploit(serial, client, tunnel, directOK, cleanup)
@@ -526,7 +527,8 @@ func (s *Scanner) processOnlineClient(serial string, client *p2p.DHClient) {
 	s.mu.Unlock()
 }
 
-func (s *Scanner) useProvidedCreds(serial string, client *p2p.DHClient, tunnel *p2p.PTCPTunnel, directOK bool, cred ProvidedCred, cleanup func()) {
+// report whether the provided credentials took the device
+func (s *Scanner) useProvidedCreds(serial string, client *p2p.DHClient, tunnel *p2p.PTCPTunnel, directOK bool, cred ProvidedCred, cleanup func()) bool {
 	if until, locked := s.deviceLocked(serial); locked {
 		LogCredsLocked(serial, until)
 		s.mu.Lock()
@@ -535,16 +537,10 @@ func (s *Scanner) useProvidedCreds(serial string, client *p2p.DHClient, tunnel *
 		s.doneUnits += s.unitTotal - 1
 		s.mu.Unlock()
 		go cleanup()
-		return
+		return true
 	}
 	if !s.verifyInputCreds(serial, tunnel, cred.Login, cred.Password) {
-		s.mu.Lock()
-		s.SafeCount++
-		s.CompletedCount++
-		s.doneUnits += s.unitTotal - 1
-		s.mu.Unlock()
-		go cleanup()
-		return
+		return false
 	}
 	ip := ""
 	if addr := client.GetDeviceAddr(); addr != "" {
@@ -586,6 +582,7 @@ func (s *Scanner) useProvidedCreds(serial string, client *p2p.DHClient, tunnel *
 	s.handlePwnedResult(serial, ip, res, tunnel, func(*ExploitResult) (*p2p.PTCPTunnel, bool) {
 		return tunnel, false
 	}, cleanup)
+	return true
 }
 
 func (s *Scanner) deviceLocked(serial string) (time.Time, bool) {
