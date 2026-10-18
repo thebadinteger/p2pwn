@@ -136,7 +136,7 @@ func (t *PTCPTunnel) RTSPSnapshot(channel int, timeout time.Duration) ([]byte, e
 
 func rtspSnapshotVia(addr string, channel int, user, pass string, timeout time.Duration) ([]byte, error) {
 	var lastErr error
-	for _, subtype := range []int{1, 0} {
+	for _, subtype := range []int{0, 1} {
 		u := fmt.Sprintf("rtsp://%s/cam/realmonitor?channel=%d&subtype=%d", addr, channel, subtype)
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		data, err := rtsnap.SnapshotJPEG(ctx, u, 85,
