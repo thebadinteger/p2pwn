@@ -154,10 +154,7 @@ func ParseDeviceXML(data []byte) (creds []ProvidedCred, serials []string) {
 		devices = dm.Devices
 	}
 	for _, dev := range devices {
-		serial := strings.TrimSpace(dev.Name)
-		if serial == "" {
-			serial = strings.TrimSpace(dev.Domain)
-		}
+		serial := strings.TrimSpace(dev.Domain)
 		if serial == "" {
 			continue
 		}

@@ -105,7 +105,16 @@ func (s *Scanner) governorOn() bool {
 }
 
 func isPrefix(target string) bool {
-	return len(target) == 10
+	if len(target) != 10 {
+		return false
+	}
+	for i := 0; i < len(target); i++ {
+		c := target[i]
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Scanner) Run() {
