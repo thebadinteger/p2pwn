@@ -29,13 +29,9 @@ type PTCPTunnel struct {
 	user     string
 	pass     string
 	sendMu   sync.Mutex
-	// ForwardToLocal runs one reader per forwarded conn and every
-	// reader parks payloads for other realms in recvBufs so the map
-	// needs its own lock a bare map write here crashed the process
-	recvMu sync.Mutex
+	recvMu   sync.Mutex
 }
 
-// takeRecvBuf removes and returns whatever was parked for a realm
 func (t *PTCPTunnel) takeRecvBuf(realm uint32) []byte {
 	t.recvMu.Lock()
 	defer t.recvMu.Unlock()
@@ -46,14 +42,12 @@ func (t *PTCPTunnel) takeRecvBuf(realm uint32) []byte {
 	return data
 }
 
-// parkRecvBuf queues a payload that belongs to another realm
 func (t *PTCPTunnel) parkRecvBuf(realm uint32, payload []byte) {
 	t.recvMu.Lock()
 	t.recvBufs[realm] = append(t.recvBufs[realm], payload...)
 	t.recvMu.Unlock()
 }
 
-// putRecvBuf restores a partially read packet for the same realm
 func (t *PTCPTunnel) putRecvBuf(realm uint32, data []byte) {
 	t.recvMu.Lock()
 	t.recvBufs[realm] = data
@@ -1814,8 +1808,6 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 		}
 		body := extractBody(r.resp)
 		kv := parseKV(r.resp)
-		// deviceType is a numeric product code on some firmwares the
-		// readable name sits next to it so a bare number is never taken
 		for _, cand := range []string{
 			kv["deviceType"], kv["model"],
 			xmlTag(body, "deviceType"), xmlTag(body, "model"),
@@ -1907,9 +1899,6 @@ func hasErrPrefix(s string) bool {
 	return strings.HasPrefix(s, "Error") || strings.Contains(s, "Bad Request")
 }
 
-// plausibleModel rejects the shapes the cgi fills in when it has no
-// real answer a numeric product code an html page or an empty reply
-// the caller then keeps looking instead of stopping on garbage
 func plausibleModel(s string) bool {
 	s = strings.TrimSpace(s)
 	if s == "" {

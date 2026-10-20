@@ -226,7 +226,7 @@ func (c *DHClient) newChannelIdentity(prof *CloudProfile) *channelIdentity {
 	return &channelIdentity{identify: string(identify), created: time.Now().Unix(), cseq: prof.nextCSeq()}
 }
 
-// renders the p2p-channel XML for one crypto generation
+// render the p2p-channel XML for one crypto generation
 func (c *DHClient) channelBody(id *channelIdentity, laddrPlain string) (body string, key []byte) {
 	if c.dtype == 0 {
 		return fmt.Sprintf("<body><Identify>%s</Identify><IpEncrpt>true</IpEncrpt><LocalAddr>%s</LocalAddr><version>%s</version></body>",
@@ -278,7 +278,7 @@ func (c *DHClient) startRelayAgent(prof *CloudProfile, token string) {
 	}
 }
 
-// notifies the device about the allocated relay agent
+// notify the device about the allocated relay agent
 func (c *DHClient) waitRelayChannelAck(prof *CloudProfile, body string, timeout time.Duration, maxAttempts int) error {
 	path := "/device/" + c.serial + "/relay-channel"
 	method := prof.verbFor(body)

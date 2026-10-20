@@ -1105,9 +1105,6 @@ func (s *Scanner) handlePwned(serial string, res *ExploitResult) {
 	s.mu.Unlock()
 }
 
-// cleanModelName keeps only something that can honestly be a model
-// every source gets funnelled here because the device happily answers
-// getDeviceType with an html error page or a bare number
 func cleanModelName(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
