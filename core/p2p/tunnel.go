@@ -29,6 +29,35 @@ type PTCPTunnel struct {
 	user     string
 	pass     string
 	sendMu   sync.Mutex
+	// ForwardToLocal runs one reader per forwarded conn and every
+	// reader parks payloads for other realms in recvBufs so the map
+	// needs its own lock a bare map write here crashed the process
+	recvMu sync.Mutex
+}
+
+// takeRecvBuf removes and returns whatever was parked for a realm
+func (t *PTCPTunnel) takeRecvBuf(realm uint32) []byte {
+	t.recvMu.Lock()
+	defer t.recvMu.Unlock()
+	data := t.recvBufs[realm]
+	if data != nil {
+		delete(t.recvBufs, realm)
+	}
+	return data
+}
+
+// parkRecvBuf queues a payload that belongs to another realm
+func (t *PTCPTunnel) parkRecvBuf(realm uint32, payload []byte) {
+	t.recvMu.Lock()
+	t.recvBufs[realm] = append(t.recvBufs[realm], payload...)
+	t.recvMu.Unlock()
+}
+
+// putRecvBuf restores a partially read packet for the same realm
+func (t *PTCPTunnel) putRecvBuf(realm uint32, data []byte) {
+	t.recvMu.Lock()
+	t.recvBufs[realm] = data
+	t.recvMu.Unlock()
 }
 
 func newTunnel(c *DHClient, conn *net.UDPConn, addr string, session *PTCPSession) *PTCPTunnel {
@@ -46,9 +75,8 @@ func newTunnel(c *DHClient, conn *net.UDPConn, addr string, session *PTCPSession
 
 func (t *PTCPTunnel) readOneDataForRealm(realm uint32, timeout time.Duration) ([]byte, error) {
 	conn := t.conn
-	if len(t.recvBufs[realm]) > 0 {
-		data := t.recvBufs[realm]
-		delete(t.recvBufs, realm)
+	data := t.takeRecvBuf(realm)
+	if data != nil {
 		return data, nil
 	}
 	conn.SetReadDeadline(time.Now().Add(timeout))
@@ -84,7 +112,7 @@ func (t *PTCPTunnel) readOneDataForRealm(realm uint32, timeout time.Duration) ([
 				continue
 			}
 			if r != realm {
-				t.recvBufs[r] = append(t.recvBufs[r], payload...)
+				t.parkRecvBuf(r, payload)
 				t.sendACK()
 				continue
 			}
@@ -131,9 +159,8 @@ func (t *PTCPTunnel) ReadData(timeout time.Duration) ([]byte, error) {
 	conn := t.conn
 	var out []byte
 
-	if len(t.recvBufs[t.realm]) > 0 {
-		out = t.recvBufs[t.realm]
-		delete(t.recvBufs, t.realm)
+	if b := t.takeRecvBuf(t.realm); b != nil {
+		out = b
 	}
 
 	conn.SetReadBuffer(512 * 1024)
@@ -196,7 +223,7 @@ func (t *PTCPTunnel) ReadData(timeout time.Duration) ([]byte, error) {
 				continue
 			}
 			if realm != t.realm {
-				t.recvBufs[realm] = append(t.recvBufs[realm], payload...)
+				t.parkRecvBuf(realm, payload)
 				if ackNow {
 					t.sendACK()
 				}
@@ -349,9 +376,8 @@ func (t *PTCPTunnel) readDataSkipDisc(realm uint32, timeout time.Duration) ([]by
 	conn := t.conn
 	deadline := time.Now().Add(timeout)
 
-	if len(t.recvBufs[realm]) > 0 {
-		data := t.recvBufs[realm]
-		delete(t.recvBufs, realm)
+	data := t.takeRecvBuf(realm)
+	if data != nil {
 		return data, nil
 	}
 
@@ -392,7 +418,7 @@ func (t *PTCPTunnel) readDataSkipDisc(realm uint32, timeout time.Duration) ([]by
 				continue
 			}
 			if r != realm {
-				t.recvBufs[r] = append(t.recvBufs[r], payload...)
+				t.parkRecvBuf(r, payload)
 				t.sendACK()
 				continue
 			}
@@ -541,9 +567,8 @@ func (t *PTCPTunnel) readHTTPPayload(realm uint32, out []byte, timeout time.Dura
 		conn.SetReadDeadline(time.Time{})
 	}
 
-	if len(t.recvBufs[realm]) > 0 {
-		data := t.recvBufs[realm]
-		delete(t.recvBufs, realm)
+	data := t.takeRecvBuf(realm)
+	if data != nil {
 		return data, nil
 	}
 
@@ -588,7 +613,7 @@ func (t *PTCPTunnel) readHTTPPayload(realm uint32, out []byte, timeout time.Dura
 				continue
 			}
 			if r != realm {
-				t.recvBufs[r] = append(t.recvBufs[r], payload...)
+				t.parkRecvBuf(r, payload)
 				t.sendACK()
 				continue
 			}
@@ -736,8 +761,7 @@ func (c *DHIPClient) send(method string, params any, id int, object any, sid ...
 
 func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 	deadline := time.Now().Add(timeout)
-	buf := c.tunnel.recvBufs[c.realm]
-	delete(c.tunnel.recvBufs, c.realm)
+	buf := c.tunnel.takeRecvBuf(c.realm)
 
 	var magicIdx int
 	for {
@@ -748,7 +772,7 @@ func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 		chunk, err := c.tunnel.readOneDataForRealm(c.realm, time.Until(deadline))
 		if err != nil {
 			if len(buf) > 0 {
-				c.tunnel.recvBufs[c.realm] = buf
+				c.tunnel.putRecvBuf(c.realm, buf)
 			}
 			return nil, fmt.Errorf("dhip read header: %w", err)
 		}
@@ -767,7 +791,7 @@ func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 		chunk, err := c.tunnel.readOneDataForRealm(c.realm, time.Until(deadline))
 		if err != nil {
 			if len(buf) > 0 {
-				c.tunnel.recvBufs[c.realm] = buf
+				c.tunnel.putRecvBuf(c.realm, buf)
 			}
 			return nil, fmt.Errorf("dhip read body: %w", err)
 		}
@@ -776,7 +800,7 @@ func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 
 	bodyRaw := buf[32:totalNeeded]
 	if len(buf) > totalNeeded {
-		c.tunnel.recvBufs[c.realm] = buf[totalNeeded:]
+		c.tunnel.putRecvBuf(c.realm, buf[totalNeeded:])
 	}
 
 	if bodyLen == 0 {
@@ -1790,21 +1814,19 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 		}
 		body := extractBody(r.resp)
 		kv := parseKV(r.resp)
-		if m := kv["deviceType"]; m != "" && !hasErrPrefix(m) {
-			model = m
-			break
+		// deviceType is a numeric product code on some firmwares the
+		// readable name sits next to it so a bare number is never taken
+		for _, cand := range []string{
+			kv["deviceType"], kv["model"],
+			xmlTag(body, "deviceType"), xmlTag(body, "model"),
+			kv["type"], xmlTag(body, "type"),
+		} {
+			if cand != "" && !hasErrPrefix(cand) && plausibleModel(cand) {
+				model = cand
+				break
+			}
 		}
-		if m := kv["model"]; m != "" && !hasErrPrefix(m) {
-			model = m
-			break
-		}
-
-		if m := xmlTag(body, "deviceType"); m != "" && !hasErrPrefix(m) {
-			model = m
-			break
-		}
-		if m := xmlTag(body, "model"); m != "" && !hasErrPrefix(m) {
-			model = m
+		if model != "" {
 			break
 		}
 	}
@@ -1822,20 +1844,17 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 				continue
 			}
 			body := extractBody(r.resp)
-			if m := strings.TrimSpace(string(body)); m != "" && !hasErrPrefix(m) {
-
-				if v := xmlTag(body, "type"); v != "" {
-					m = v
+			kv := parseKV(r.resp)
+			for _, cand := range []string{
+				xmlTag(body, "type"), kv["type"], kv["deviceType"],
+				strings.TrimSpace(string(body)),
+			} {
+				if cand != "" && !hasErrPrefix(cand) && plausibleModel(cand) {
+					model = cand
+					break
 				}
-				// keep the bare value
-				if kv := parseKV(r.resp); len(kv) > 0 {
-					if v := kv["type"]; v != "" {
-						m = v
-					} else if v := kv["deviceType"]; v != "" {
-						m = v
-					}
-				}
-				model = m
+			}
+			if model != "" {
 				break
 			}
 		}
@@ -1886,6 +1905,36 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 
 func hasErrPrefix(s string) bool {
 	return strings.HasPrefix(s, "Error") || strings.Contains(s, "Bad Request")
+}
+
+// plausibleModel rejects the shapes the cgi fills in when it has no
+// real answer a numeric product code an html page or an empty reply
+// the caller then keeps looking instead of stopping on garbage
+func plausibleModel(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	lower := strings.ToLower(s)
+	for _, bad := range []string{"<", ">", "html", "<?xml", "302 found", "404 not found", "not found", "bad request", "error"} {
+		if strings.Contains(lower, bad) {
+			return false
+		}
+	}
+	digits := 0
+	runes := []rune(s)
+	for _, r := range runes {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	if digits == len(runes) {
+		return false
+	}
+	if len(runes) > 64 {
+		return false
+	}
+	return true
 }
 
 // fetch the model over DHIP

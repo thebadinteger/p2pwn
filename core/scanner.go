@@ -1083,6 +1083,7 @@ func (s *Scanner) launchExtras(serial string, tunnel *p2p.PTCPTunnel, res *Explo
 }
 
 func (s *Scanner) handlePwned(serial string, res *ExploitResult) {
+	res.Model = cleanModelName(res.Model)
 	LogExploitPwned(serial, res.Method, res.Login, res.Password)
 	s.mu.Lock()
 	s.PwnedCount++
@@ -1102,6 +1103,39 @@ func (s *Scanner) handlePwned(serial string, res *ExploitResult) {
 	// Save to import_*.xml
 	s.writeXMLFiles(serial, res)
 	s.mu.Unlock()
+}
+
+// cleanModelName keeps only something that can honestly be a model
+// every source gets funnelled here because the device happily answers
+// getDeviceType with an html error page or a bare number
+func cleanModelName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	for _, bad := range []string{"<html", "<?xml", "<head", "<body", "302 found", "404 not found", "bad request"} {
+		if strings.Contains(lower, bad) {
+			return ""
+		}
+	}
+	if strings.ContainsAny(s, "<>{}") {
+		return ""
+	}
+	// a bare number is a channel count or an error code never a model
+	digits := 0
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	if digits == len([]rune(s)) {
+		return ""
+	}
+	if len([]rune(s)) > 64 {
+		s = string([]rune(s)[:64])
+	}
+	return s
 }
 
 func csvField(s string) string {
