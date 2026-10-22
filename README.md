@@ -55,8 +55,6 @@ Default > DD-MM-YYYY_HH-MM-SS
 If doesn't exist, will be created
 [-t, --threads] Number of threads for scanning
 Default > 100
-[-m, --model] Model filter for dhscp input, * wildcards
-Default > *
 [-c, --config] Path to config file
 Default > config.toml
 [-n, --nuke] Use destructive options

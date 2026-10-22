@@ -11,11 +11,10 @@ type inputSink struct {
 	targets  []string
 	provided []ProvidedCred
 	seen     map[string]struct{}
-	model    string
 }
 
-func newInputSink(modelFilter string) *inputSink {
-	return &inputSink{seen: map[string]struct{}{}, model: strings.TrimSpace(modelFilter)}
+func newInputSink() *inputSink {
+	return &inputSink{seen: map[string]struct{}{}}
 }
 
 func (s *inputSink) addSerial(serial string) {
@@ -86,10 +85,6 @@ func (s *inputSink) addDhscpRow(line string) bool {
 	if !looksLikeDhscpModel(model) || !looksLikeDhscpTarget(target) {
 		return false
 	}
-	// filtered rows must not fall through as targets
-	if s.model != "" && !modelMatches(s.model, model) {
-		return true
-	}
 	s.addSerial(target)
 	return true
 }
@@ -121,35 +116,6 @@ func looksLikeDhscpTarget(s string) bool {
 		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
 			return false
 		}
-	}
-	return true
-}
-
-func modelMatches(pattern, value string) bool {
-	pattern = strings.TrimSpace(pattern)
-	if pattern == "" || pattern == "*" {
-		return true
-	}
-	parts := strings.Split(pattern, "*")
-	if len(parts) == 1 {
-		return strings.EqualFold(pattern, value)
-	}
-	rest := value
-	for i, part := range parts {
-		if part == "" {
-			continue
-		}
-		idx := strings.Index(strings.ToLower(rest), strings.ToLower(part))
-		if idx < 0 {
-			return false
-		}
-		if i == 0 && idx != 0 {
-			return false
-		}
-		rest = rest[idx+len(part):]
-	}
-	if last := parts[len(parts)-1]; last != "" {
-		return strings.HasSuffix(strings.ToLower(value), strings.ToLower(last))
 	}
 	return true
 }
@@ -213,12 +179,8 @@ func (s *inputSink) addDir(dir string) error {
 	})
 }
 
-func LoadInput(arg string, modelFilter ...string) (targets []string, provided []ProvidedCred, err error) {
-	filter := ""
-	if len(modelFilter) > 0 {
-		filter = modelFilter[0]
-	}
-	sink := newInputSink(filter)
+func LoadInput(arg string) (targets []string, provided []ProvidedCred, err error) {
+	sink := newInputSink()
 
 	if _, statErr := os.Stat(arg); statErr == nil {
 		if err := sink.addFile(arg); err != nil {
