@@ -705,9 +705,10 @@ func (t *PTCPTunnel) DoHTTPOnRealm(realm uint32, req []byte, timeout time.Durati
 }
 
 type DHIPClient struct {
-	tunnel *PTCPTunnel
-	realm  uint32
-	sess   int
+	tunnel    *PTCPTunnel
+	realm     uint32
+	sess      int
+	authRealm string
 }
 
 var dhipMagic = []byte{0x20, 0x00, 0x00, 0x00, 0x44, 0x48, 0x49, 0x50}
@@ -726,6 +727,10 @@ func (c *DHIPClient) Close() {
 
 func (c *DHIPClient) Session() int {
 	return c.sess
+}
+
+func (c *DHIPClient) AuthRealm() string {
+	return c.authRealm
 }
 
 func (c *DHIPClient) send(method string, params any, id int, object any, sid ...any) error {
@@ -924,6 +929,7 @@ func (c *DHIPClient) LoginNetKeyboard() error {
 	random, _ := params["random"].(string)
 	challengeSess := dhipSessOf(r)
 	c.sess = challengeSess
+	c.authRealm = realm
 
 	if realm != "" && random != "" {
 

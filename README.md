@@ -166,7 +166,7 @@ Tips:
 - `protocol.cgi` - Can check CVEs and brute
 - `protocol.sdk` - Can only brute (Disable to speed up the scan if not scanning NVRs)
 - `protocol.type1` - Can only brute (Disable to speed up the scan if not scanning Type 1 devices)
-- `methods.cve-2021-33044` - Extracts admin credentials
+- `methods.cve-2021-33044` - Extracts admin credentials, adds a dummy account (fallback)
 - `methods.cve-2021-33045` - Extracts admin credentials, adds a dummy account (fallback)
 - `methods.uau` - Adds a dummy account
 - `type1.delay` - Type 1 brute attempts delay in seconds (not recommended to change)
