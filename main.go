@@ -33,13 +33,14 @@ func printHelp() {
 	fmt.Printf("Format:\n")
 	fmt.Printf("XXXXXXXXXX > Prefix\n")
 	fmt.Printf("XXXXXXXXXXYYYYY > S/N\n")
-	fmt.Printf("model,prefix > dhscp\n")
-	fmt.Printf("others > csv,xml,folders\n")
+	fmt.Printf("others > csv,xml,dhscp,folders\n")
 	fmt.Printf("[-o, --output] Output folder for results\n")
 	fmt.Printf("Default > DD-MM-YYYY_HH-MM-SS\n")
 	fmt.Printf("If doesn't exist, will be created\n")
 	fmt.Printf("[-t, --threads] Number of threads for scanning\n")
 	fmt.Printf("Default > 100\n")
+	fmt.Printf("[-m, --model] Model filter for dhscp input, * wildcards\n")
+	fmt.Printf("Default > *\n")
 	fmt.Printf("[-c, --config] Path to config file\n")
 	fmt.Printf("Default > config.toml\n")
 	fmt.Printf("[-n, --nuke] Use destructive options\n")
@@ -83,6 +84,7 @@ func main() {
 	configPath := "config.toml"
 	debugEnabled := false
 	nukeEnabled := false
+	modelFilter := ""
 	showHelp := false
 
 	for i := 0; i < len(args); i++ {
@@ -108,6 +110,11 @@ func main() {
 				configPath = args[i+1]
 				i++
 			}
+		case "-m", "--model":
+			if i+1 < len(args) {
+				modelFilter = args[i+1]
+				i++
+			}
 		case "-d", "--debug":
 			debugEnabled = true
 		case "-n", "--nuke":
@@ -129,7 +136,7 @@ func main() {
 	// Parse input
 	inputSource := input
 
-	targets, provided, err := core.LoadInput(input)
+	targets, provided, err := core.LoadInput(input, modelFilter)
 	if err != nil {
 		printErrorAndExit(err.Error())
 	}

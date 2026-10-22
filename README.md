@@ -49,19 +49,19 @@ Or download the latest binary from the **[Releases page](https://github.com/theb
 Format:
 XXXXXXXXXX > Prefix
 XXXXXXXXXXYYYYY > S/N
-model,prefix > dhscp
-others > csv,xml,folders
+others > csv,xml,dhscp,folders
 [-o, --output] Output folder for results
 Default > DD-MM-YYYY_HH-MM-SS
 If doesn't exist, will be created
 [-t, --threads] Number of threads for scanning
 Default > 100
+[-m, --model] Model filter for dhscp input, * wildcards
+Default > *
 [-c, --config] Path to config file
 Default > config.toml
 [-n, --nuke] Use destructive options
 [-d, --debug] Log everything
 [-?, -h, --help] Get general help
-[GPLv3] github.com/thebadinteger
 ```  
 
 **Input format:**  
@@ -73,6 +73,7 @@ XXXXXXXXXXYYYYY
 ```
 XXXXXXXXXX,XXXXXXXXXXYYYYY
 ```  
+or `csv,xml,dhscp,folders`  
 **Output format:**  
 pwned.csv:
 ```

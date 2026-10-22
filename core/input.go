@@ -11,10 +11,11 @@ type inputSink struct {
 	targets  []string
 	provided []ProvidedCred
 	seen     map[string]struct{}
+	model    string
 }
 
-func newInputSink() *inputSink {
-	return &inputSink{seen: map[string]struct{}{}}
+func newInputSink(modelFilter string) *inputSink {
+	return &inputSink{seen: map[string]struct{}{}, model: strings.TrimSpace(modelFilter)}
 }
 
 func (s *inputSink) addSerial(serial string) {
@@ -28,7 +29,7 @@ func (s *inputSink) addSerial(serial string) {
 	s.targets = append(s.targets, serial)
 }
 
-// last write wins a later file overrides an earlier credential set
+// later file overrides earlier creds
 func (s *inputSink) addCred(c ProvidedCred) {
 	if c.Serial == "" || c.Login == "" {
 		return
@@ -65,10 +66,92 @@ func (s *inputSink) addPlain(content string) {
 			s.addXML([]byte(line))
 			continue
 		}
+		if s.addDhscpRow(line) {
+			continue
+		}
 		for _, part := range strings.Split(line, ",") {
 			s.addToken(part)
 		}
 	}
+}
+
+// dhscp row model then prefix or serial ip optional
+func (s *inputSink) addDhscpRow(line string) bool {
+	cols := splitCSVLine(line)
+	if len(cols) < 2 || len(cols) > 4 {
+		return false
+	}
+	model := strings.TrimSpace(cols[0])
+	target := strings.TrimSpace(cols[1])
+	if !looksLikeDhscpModel(model) || !looksLikeDhscpTarget(target) {
+		return false
+	}
+	// filtered rows must not fall through as targets
+	if s.model != "" && !modelMatches(s.model, model) {
+		return true
+	}
+	s.addSerial(target)
+	return true
+}
+
+func looksLikeDhscpModel(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	if looksLikeDhscpTarget(s) {
+		return false
+	}
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return true
+		}
+	}
+	return false
+}
+
+// 10 char prefix or full serial
+func looksLikeDhscpTarget(s string) bool {
+	if len(s) < 10 || len(s) > 24 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+func modelMatches(pattern, value string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" || pattern == "*" {
+		return true
+	}
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return strings.EqualFold(pattern, value)
+	}
+	rest := value
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(strings.ToLower(rest), strings.ToLower(part))
+		if idx < 0 {
+			return false
+		}
+		if i == 0 && idx != 0 {
+			return false
+		}
+		rest = rest[idx+len(part):]
+	}
+	if last := parts[len(parts)-1]; last != "" {
+		return strings.HasSuffix(strings.ToLower(value), strings.ToLower(last))
+	}
+	return true
 }
 
 func (s *inputSink) addXML(data []byte) {
@@ -130,8 +213,12 @@ func (s *inputSink) addDir(dir string) error {
 	})
 }
 
-func LoadInput(arg string) (targets []string, provided []ProvidedCred, err error) {
-	sink := newInputSink()
+func LoadInput(arg string, modelFilter ...string) (targets []string, provided []ProvidedCred, err error) {
+	filter := ""
+	if len(modelFilter) > 0 {
+		filter = modelFilter[0]
+	}
+	sink := newInputSink(filter)
 
 	if _, statErr := os.Stat(arg); statErr == nil {
 		if err := sink.addFile(arg); err != nil {
