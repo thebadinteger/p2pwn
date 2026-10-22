@@ -1540,11 +1540,23 @@ func insertAuthHeader(req, authHeader string) string {
 	return strings.Join(result, "\r\n")
 }
 
-func (t *PTCPTunnel) Snapshot() ([]byte, error) {
-	urls := []string{
-		"/cgi-bin/snapshot.cgi?action=snapshot&channel=1",
-		"/cgi-bin/snapshot.cgi",
-		"/cgi-bin/jpeg.cgi?channel=1",
+func (t *PTCPTunnel) Snapshot(channel int) ([]byte, error) {
+	if channel <= 0 {
+		channel = 1
+	}
+	var urls []string
+	if channel == 1 {
+		urls = []string{
+			"/cgi-bin/snapshot.cgi?action=snapshot&channel=1",
+			"/cgi-bin/snapshot.cgi",
+			"/cgi-bin/jpeg.cgi?channel=1",
+		}
+	} else {
+		urls = []string{
+			fmt.Sprintf("/cgi-bin/snapshot.cgi?action=snapshot&channel=%d", channel),
+			fmt.Sprintf("/cgi-bin/snapshot.cgi?channel=%d", channel),
+			fmt.Sprintf("/cgi-bin/jpeg.cgi?channel=%d", channel),
+		}
 	}
 
 	for _, u := range urls {

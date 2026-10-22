@@ -90,7 +90,7 @@ import_*.xml:
 snapshots/:  
 *Special password characters are not displayed in the file name*  
 ```
-{serial}_{login}_{password}_{model}.jpg
+{serial}_{login}_{password}_{model}_{channel(s)}.jpg
 ```  
 
 ## Configuration:  
@@ -118,6 +118,7 @@ methods.uau = true # Unauthenticated addUser
 
 [image]
 snapshot = true # Take snapshots
+all = false # Take snapshots from all channels
 cgi = true # Take snapshots with CGI
 sdk = true # Take snapshots with SDK
 rtsp = true # Take snapshots with RTSP
@@ -160,7 +161,8 @@ disable = false # Disable P2P on the device when done
 Tips:  
 - `nurses` - The higher, the faster the S/N check (online/offline), but more packets
 - `maxrps` - Cap on concurrent online/offline checks (the higher, the faster)
-- `snapshot` - Takes snapshot of the first channel (Disabling it can speed up the scan)
+- `snapshot` - Takes snapshots (disabling it can speed up the scan)
+- `all` - Takes snapshots from every channel instead of only the first one
 - `protocol.cgi` - Can check CVEs and brute
 - `protocol.sdk` - Can only brute (Disable to speed up the scan if not scanning NVRs)
 - `protocol.type1` - Can only brute (Disable to speed up the scan if not scanning Type 1 devices)

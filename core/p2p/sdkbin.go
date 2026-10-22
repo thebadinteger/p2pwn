@@ -13,6 +13,8 @@ type SDKClient struct {
 	tunnel *PTCPTunnel
 	user   string
 	pass   string
+	realm  uint32
+	opened bool
 }
 
 func NewSDKClient(tunnel *PTCPTunnel, user, pass string) *SDKClient {
@@ -237,7 +239,52 @@ func (s *SDKClient) loginOnBindSingle(realm uint32) error {
 	return nil
 }
 
+func (s *SDKClient) Close() {
+	if !s.opened {
+		return
+	}
+	s.tunnel.DisconnectRealm(s.realm)
+	s.opened = false
+}
+
+func (s *SDKClient) openSnapshotSession() error {
+	if s.opened {
+		return nil
+	}
+	realm := rand.Uint32()
+	if err := s.bindRealm(realm); err != nil {
+		return fmt.Errorf("snapshot bind: %w", err)
+	}
+	loginRealm, err := s.loginOnBind(realm)
+	if err != nil {
+		s.tunnel.DisconnectRealm(realm)
+		if loginRealm != realm {
+			s.tunnel.DisconnectRealm(loginRealm)
+		}
+		return fmt.Errorf("snapshot login: %w", err)
+	}
+	if loginRealm != realm {
+		s.tunnel.DisconnectRealm(realm)
+		realm = loginRealm
+	}
+	s.realm = realm
+	s.opened = true
+	return nil
+}
+
 func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
+	if err := s.openSnapshotSession(); err != nil {
+		return nil, err
+	}
+	data, err := s.snapshotOnSession(channel)
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	return data, nil
+}
+
+func (s *SDKClient) snapshotOnSession(channel int) ([]byte, error) {
 	ch := byte(0)
 	if channel > 0 {
 		ch = byte(channel - 1)
@@ -259,20 +306,7 @@ func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	}
 
-	realm := rand.Uint32()
-	if err := s.bindRealm(realm); err != nil {
-		return nil, fmt.Errorf("snapshot bind: %w", err)
-	}
-	defer s.tunnel.DisconnectRealm(realm)
-
-	loginRealm, err := s.loginOnBind(realm)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot login: %w", err)
-	}
-	if loginRealm != realm {
-		defer s.tunnel.DisconnectRealm(loginRealm)
-		realm = loginRealm
-	}
+	realm := s.realm
 
 	s.tunnel.readDataSkipDisc(realm, 50*time.Millisecond)
 

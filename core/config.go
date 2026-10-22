@@ -27,6 +27,7 @@ type PwnConfig struct {
 
 type ImageConfig struct {
 	Snapshot bool `toml:"snapshot"`
+	All      bool `toml:"all"`
 	Rtsp     bool `toml:"rtsp"`
 	Cgi      bool `toml:"cgi"`
 	Sdk      bool `toml:"sdk"`
@@ -109,6 +110,7 @@ methods.uau = true # Unauthenticated addUser
 
 [image]
 snapshot = true # Take snapshots
+all = false # Take snapshot from all channels
 cgi = true # Take snapshots with CGI
 sdk = true # Take snapshots with SDK
 rtsp = true # Take snapshots with RTSP

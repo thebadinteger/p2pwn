@@ -17,6 +17,7 @@ methods.uau = true # Unauthenticated addUser
 
 [image]
 snapshot = true # Take snapshots
+all = false # Take snapshots from all channels
 cgi = true # Take snapshots with CGI
 sdk = true # Take snapshots with SDK
 rtsp = true # Take snapshots with RTSP
