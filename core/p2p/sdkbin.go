@@ -272,11 +272,15 @@ func (s *SDKClient) openSnapshotSession() error {
 	return nil
 }
 
-func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
+func (s *SDKClient) GetSnapshot(channel int, timeouts ...time.Duration) ([]byte, error) {
+	readTimeout := 5 * time.Second
+	if len(timeouts) > 0 && timeouts[0] > 0 {
+		readTimeout = timeouts[0]
+	}
 	if err := s.openSnapshotSession(); err != nil {
 		return nil, err
 	}
-	data, err := s.snapshotOnSession(channel)
+	data, err := s.snapshotOnSession(channel, readTimeout)
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -284,7 +288,7 @@ func (s *SDKClient) GetSnapshot(channel int) ([]byte, error) {
 	return data, nil
 }
 
-func (s *SDKClient) snapshotOnSession(channel int) ([]byte, error) {
+func (s *SDKClient) snapshotOnSession(channel int, readTimeout time.Duration) ([]byte, error) {
 	ch := byte(0)
 	if channel > 0 {
 		ch = byte(channel - 1)
@@ -316,7 +320,7 @@ func (s *SDKClient) snapshotOnSession(channel int) ([]byte, error) {
 
 	var jpegData []byte
 	for i := 0; i < 64; i++ {
-		chunk, err := s.tunnel.readDataSkipDisc(realm, 5*time.Second)
+		chunk, err := s.tunnel.readDataSkipDisc(realm, readTimeout)
 		if err != nil {
 			break
 		}

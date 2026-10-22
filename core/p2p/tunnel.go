@@ -1547,8 +1547,15 @@ func insertAuthHeader(req, authHeader string) string {
 }
 
 func (t *PTCPTunnel) Snapshot(channel int) ([]byte, error) {
+	return t.SnapshotTimeout(channel, 10*time.Second)
+}
+
+func (t *PTCPTunnel) SnapshotTimeout(channel int, timeout time.Duration) ([]byte, error) {
 	if channel <= 0 {
 		channel = 1
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
 	}
 	var urls []string
 	if channel == 1 {
@@ -1567,8 +1574,14 @@ func (t *PTCPTunnel) Snapshot(channel int) ([]byte, error) {
 
 	for _, u := range urls {
 		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: Mozilla/5.0\r\nAccept: image/jpeg,image/webp,image/*,*/*\r\nConnection: close\r\n\r\n", u)
-		resp, err := t.DoHTTPAuth([]byte(req), 10*time.Second)
-		if err != nil || len(resp) == 0 {
+		resp, err := t.DoHTTPAuth([]byte(req), timeout)
+		if err != nil {
+			if isTimeoutErr(err) {
+				return nil, fmt.Errorf("snapshot: %w", err)
+			}
+			continue
+		}
+		if len(resp) == 0 {
 			continue
 		}
 		if jpegData, ok := ExtractJPEG(resp); ok {
@@ -1826,6 +1839,15 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 		}
 		body := extractBody(r.resp)
 		kv := parseKV(r.resp)
+		for k, v := range kv {
+			switch strings.ToLower(k) {
+			case "videoinputchannels", "videoinchannels", "channelnum",
+				"videoinputchannelnum", "maxvideoinputchannels":
+				if n, err := strconv.Atoi(strings.Trim(v, `"`)); err == nil && n > channels {
+					channels = n
+				}
+			}
+		}
 		for _, cand := range []string{
 			kv["deviceType"], kv["model"],
 			xmlTag(body, "deviceType"), xmlTag(body, "model"),
@@ -1902,15 +1924,156 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 
 	r := doGet("/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle")
 	if !r.nvrPage && r.resp != nil {
-		if c := bytes.Count(r.resp, []byte("<table")); c > 0 {
+		body := extractBody(r.resp)
+		if c := countIndexedKeys(body, "ChannelTitle"); c > channels {
+			channels = c
+		}
+		if c := bytes.Count(r.resp, []byte("<table")); c > channels {
 			channels = c
 		}
 	}
-	if channels == 0 {
+	if t.user != "" && looksLikeRecorder(model) {
+		if c := t.deviceChannelsViaDHIP(); c > channels {
+			channels = c
+		}
+		if channels <= 1 {
+			if _, _, c, err := NewSDKClient(t, t.user, t.pass).GetDeviceInfo(); err == nil && c > channels {
+				channels = c
+			}
+		}
+	}
+	if channels < 1 {
 		channels = 1
 	}
 
 	return model, channels, firmware, nil
+}
+
+func countIndexedKeys(body []byte, key string) int {
+	s := string(body)
+	prefix := key + "["
+	seen := make(map[int]struct{})
+	for {
+		i := strings.Index(s, prefix)
+		if i < 0 {
+			break
+		}
+		s = s[i+len(prefix):]
+		j := 0
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j == 0 {
+			continue
+		}
+		if n, err := strconv.Atoi(s[:j]); err == nil {
+			seen[n] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
+func looksLikeRecorder(model string) bool {
+	m := strings.ToUpper(model)
+	for _, tag := range []string{"NVR", "XVR", "DVR", "HCVR", "HVR"} {
+		if strings.Contains(m, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *PTCPTunnel) deviceChannelsViaDHIP() int {
+	for _, port := range []int{5000, 80} {
+		dhip, err := t.NewDHIPClientOnPort(port)
+		if err != nil {
+			continue
+		}
+		if err := dhip.LoginNormal(t.user, t.pass); err != nil {
+			dhip.Close()
+			continue
+		}
+		channels := 0
+		if r, err := dhip.Call("configManager.getConfig", map[string]any{"name": "ChannelTitle"}, 20, nil, nil); err == nil {
+			channels = dhipTableLen(r)
+		}
+		if channels <= 1 {
+			if r, err := dhip.Call("magicBox.getSystemInfo", nil, 21, nil, nil); err == nil {
+				if c := dhipInfoChannels(r); c > channels {
+					channels = c
+				}
+			}
+		}
+		dhip.Close()
+		if channels > 1 {
+			return channels
+		}
+	}
+	return 0
+}
+
+func dhipTableLen(r map[string]any) int {
+	for _, key := range []string{"params", "result"} {
+		obj, _ := r[key].(map[string]any)
+		if obj == nil {
+			continue
+		}
+		switch table := obj["table"].(type) {
+		case []any:
+			if len(table) > 1 {
+				return len(table)
+			}
+		case map[string]any:
+			if list, ok := table["ChannelTitle"].([]any); ok && len(list) > 1 {
+				return len(list)
+			}
+			n, numeric := 0, true
+			for k := range table {
+				if _, err := strconv.Atoi(k); err != nil {
+					numeric = false
+					break
+				}
+				n++
+			}
+			if numeric && n > 1 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func dhipInfoChannels(r map[string]any) int {
+	best := 0
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, val := range x {
+				switch strings.ToLower(k) {
+				case "videoinputchannels", "videoinchannels", "channelnum", "videoinputchannelnum":
+					if n, ok := val.(float64); ok && int(n) > best {
+						best = int(n)
+					}
+				}
+				walk(val)
+			}
+		case []any:
+			for _, item := range x {
+				walk(item)
+			}
+		}
+	}
+	walk(r)
+	return best
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "timeout") || strings.Contains(s, "deadline exceeded")
 }
 
 func hasErrPrefix(s string) bool {

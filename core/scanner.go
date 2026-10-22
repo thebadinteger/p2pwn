@@ -628,6 +628,7 @@ func (s *Scanner) verifyInputCreds(serial string, tunnel *p2p.PTCPTunnel, login,
 func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunnel *p2p.PTCPTunnel, reopen func(*ExploitResult) (*p2p.PTCPTunnel, bool), cleanup func()) {
 	activeTunnel, fresh := reopen(res)
 	res.IP = ip
+	DebugLogf("scanner", "%s > device info model=%s channels=%d", serial, res.Model, res.Channels)
 	s.handlePwned(serial, res)
 
 	osdCleanup := cleanup
@@ -642,8 +643,9 @@ func (s *Scanner) handlePwnedResult(serial, ip string, res *ExploitResult, tunne
 
 	if s.Config.Image.Snapshot && res != nil && res.Channels > 0 && res.Login != "" && res.Password != "" {
 		captured := false
+		snapDeadline := time.Now().Add(90 * time.Second)
 		for attempt := 0; attempt < 3; attempt++ {
-			ok, snapErr := CaptureSnapshot(activeTunnel, res.Method, res.Login, res.Password, res.Channels, s.OutDir, serial, res.Model, s.Config.Image)
+			ok, snapErr := CaptureSnapshot(activeTunnel, res.Method, res.Login, res.Password, res.Channels, s.OutDir, serial, res.Model, s.Config.Image, snapDeadline)
 			if ok {
 				captured = true
 				break
@@ -939,7 +941,7 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 
 		time.Sleep(500 * time.Millisecond)
 
-		deadline := time.Now().Add(60 * time.Second)
+		deadline := time.Now().Add(90 * time.Second)
 		budgetSpent := false
 
 		for attempt := 0; attempt < retries; attempt++ {
@@ -996,7 +998,7 @@ func (s *Scanner) launchSnapshot(serial string, res *ExploitResult) bool {
 				if snapshotAttempt > 0 && time.Now().After(deadline) {
 					break
 				}
-				ok, snapErr := CaptureSnapshot(tunnel, method, login, password, channels, s.OutDir, serial, model, s.Config.Image)
+				ok, snapErr := CaptureSnapshot(tunnel, method, login, password, channels, s.OutDir, serial, model, s.Config.Image, deadline)
 				if ok {
 					snapshotOK = true
 					break

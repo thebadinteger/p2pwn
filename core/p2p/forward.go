@@ -148,6 +148,9 @@ func rtspSnapshotVia(addr string, channel int, user, pass string, timeout time.D
 			return data, nil
 		}
 		lastErr = err
+		if isTimeoutErr(err) {
+			break
+		}
 	}
 	if lastErr == nil {
 		lastErr = errors.New("rtsp: snapshot failed")
