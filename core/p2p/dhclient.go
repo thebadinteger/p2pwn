@@ -89,6 +89,8 @@ func newUDPConn() (*net.UDPConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	conn.SetReadBuffer(4 * 1024 * 1024)
+	conn.SetWriteBuffer(1 * 1024 * 1024)
 	return conn, nil
 }
 
@@ -243,24 +245,71 @@ func (c *DHClient) channelBody(id *channelIdentity, laddrPlain string) (body str
 		authStr, id.identify, encLaddr, Version), key
 }
 
+var relayAllocSem = make(chan struct{}, 6)
+
 func (c *DHClient) fetchRelayAgent(prof *CloudProfile, timeout time.Duration) (string, error) {
-	respData, err := c.doExchange(c.mainConn, c.relayAddr, prof.verbFor(""), "/relay/agent", "", true, 0, timeout, 1)
-	if err != nil {
-		return "", fmt.Errorf("recv relay agent: %w", err)
+	select {
+	case relayAllocSem <- struct{}{}:
+		defer func() { <-relayAllocSem }()
+	case <-time.After(timeout):
+		LogDebugf("relay", "allocation semaphore busy, continuing without slot")
 	}
-	resp, err := parseDHResponse(respData)
-	if err != nil {
-		return "", err
+
+	relayDispatch.remember(c.relayAddr)
+	candidates := []string{c.relayAddr}
+	if alt := relayDispatch.nextTo(c.relayAddr); alt != "" {
+		candidates = append(candidates, alt)
 	}
-	if resp.Code >= 300 {
-		return "", fmt.Errorf("relay agent returned %d", resp.Code)
+
+	var lastErr error
+	for i, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if left := relayDispatch.backoffLeft(candidate); left > 0 {
+			if i < len(candidates)-1 {
+				continue
+			}
+			if left > 2*time.Second {
+				left = 2 * time.Second
+			}
+			time.Sleep(left)
+		}
+
+		respData, err := c.doExchange(c.mainConn, candidate, prof.verbFor(""), "/relay/agent", "", true, 0, timeout, 1)
+		if err != nil {
+			lastErr = fmt.Errorf("recv relay agent: %w", err)
+			relayDispatch.penalize(candidate)
+			LogDebugf("relay", "dispatcher %s failed: %v", candidate, err)
+			continue
+		}
+		resp, err := parseDHResponse(respData)
+		if err != nil {
+			lastErr = err
+			relayDispatch.penalize(candidate)
+			continue
+		}
+		if resp.Code >= 300 {
+			lastErr = fmt.Errorf("relay agent returned %d", resp.Code)
+			relayDispatch.penalize(candidate)
+			continue
+		}
+		token := resp.XMLBody["body/Token"]
+		agent := resp.XMLBody["body/Agent"]
+		if token == "" || agent == "" {
+			lastErr = fmt.Errorf("relay agent returned no token/agent")
+			relayDispatch.penalize(candidate)
+			continue
+		}
+		relayDispatch.forgive(candidate)
+		c.relayAddr = candidate
+		c.agentAddr = agent
+		return token, nil
 	}
-	token := resp.XMLBody["body/Token"]
-	c.agentAddr = resp.XMLBody["body/Agent"]
-	if token == "" || c.agentAddr == "" {
-		return "", fmt.Errorf("relay agent returned no token/agent")
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no relay dispatcher candidates")
 	}
-	return token, nil
+	return "", lastErr
 }
 
 func (c *DHClient) startRelayAgent(prof *CloudProfile, token string) {
@@ -283,21 +332,42 @@ func (c *DHClient) waitRelayChannelAck(prof *CloudProfile, body string, timeout 
 	path := "/device/" + c.serial + "/relay-channel"
 	method := prof.verbFor(body)
 	cseq := prof.nextCSeq()
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+
+	budget := 10 * time.Second
+	if timeout > budget {
+		budget = timeout
+	}
+	if budget < 2*time.Second {
+		budget = 2 * time.Second
+	}
+	interval := 1200 * time.Millisecond
+	if interval > budget {
+		interval = budget
+	}
+	start := time.Now()
+	deadline := start.Add(budget)
+	buf := make([]byte, 4096)
+
+	for attempt := 0; attempt <= 4 && time.Now().Before(deadline); attempt++ {
 		req := prof.buildRequest(method, path, body, true, cseq)
 		if err := c.sendTo(c.mainConn, prof.MainServer, req); err != nil {
 			return fmt.Errorf("relay-channel send: %w", err)
 		}
-		deadline := time.Now().Add(timeout)
-		for time.Now().Before(deadline) {
-			c.mainConn.SetReadDeadline(deadline)
-			buf := make([]byte, 4096)
+		window := time.Now().Add(interval)
+		if window.After(deadline) {
+			window = deadline
+		}
+		for time.Now().Before(window) {
+			c.mainConn.SetReadDeadline(window)
 			n, _, rErr := c.mainConn.ReadFrom(buf)
 			if rErr != nil {
-				break // resend
+				break
 			}
 			relResp, pErr := parseDHResponse(buf[:n])
 			if pErr != nil {
+				continue
+			}
+			if relResp.Code == 100 {
 				continue
 			}
 			if relResp.Code == 200 {
@@ -310,8 +380,13 @@ func (c *DHClient) waitRelayChannelAck(prof *CloudProfile, body string, timeout 
 				return fmt.Errorf("relay-channel error %d: %s", relResp.Code, relResp.Body)
 			}
 		}
+		interval *= 2
+		if interval > 2400*time.Millisecond {
+			interval = 2400 * time.Millisecond
+		}
 	}
-	return fmt.Errorf("relay-channel timeout: no response received")
+	_ = maxAttempts
+	return fmt.Errorf("relay-channel timeout: no response after %v", budget)
 }
 
 func (c *DHClient) Handshake() error {

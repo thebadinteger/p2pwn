@@ -216,7 +216,7 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 	}
 
 	var conf Config
-	_, err := toml.DecodeFile(path, &conf)
+	md, err := toml.DecodeFile(path, &conf)
 	if err != nil {
 		line := 1
 		if pe, ok := err.(toml.ParseError); ok {
@@ -224,6 +224,85 @@ func LoadConfig(path string, isDefault bool) (*Config, error) {
 			return nil, fmt.Errorf("error in config on line %d: %s", line, pe.Message)
 		}
 		return nil, fmt.Errorf("error in config: %s", err)
+	}
+
+	decoded := map[string]bool{}
+	markDecoded := func(name string) {
+		parts := strings.Split(name, ".")
+		for i := 1; i <= len(parts); i++ {
+			decoded[strings.Join(parts[:i], ".")] = true
+		}
+	}
+	groups := map[string]bool{}
+	markGroup := func(name string) {
+		groups[name] = true
+		decoded[name] = true
+	}
+	markGroup("pwn.protocol")
+	markGroup("pwn.methods")
+	markGroup("brute.credentials")
+	markDecoded("pwn")
+	markDecoded("brute")
+	markDecoded("scan.timeout")
+	markDecoded("scan.retries")
+	markDecoded("scan.generate")
+	markDecoded("scan.nurses")
+	markDecoded("scan.governor")
+	markDecoded("scan.maxrps")
+	markDecoded("image.snapshot")
+	markDecoded("image.all")
+	markDecoded("image.cgi")
+	markDecoded("image.sdk")
+	markDecoded("image.rtsp")
+	markDecoded("brute.type1.delay")
+	markDecoded("dummy.login")
+	markDecoded("dummy.password")
+	markDecoded("dummy.memo")
+	markDecoded("overlay.osd")
+	markDecoded("overlay.channel")
+	markDecoded("overlay.custom")
+	markDecoded("overlay.color.front")
+	markDecoded("overlay.color.back")
+	markDecoded("nuke.delete")
+	markDecoded("nuke.video")
+	markDecoded("nuke.box")
+	markDecoded("nuke.coordinates.box")
+	markDecoded("nuke.disable")
+
+	var unknown []string
+	seen := map[string]bool{}
+	for _, key := range md.Keys() {
+		full := strings.Join(key, ".")
+		if seen[full] {
+			continue
+		}
+		seen[full] = true
+		if decoded[full] {
+			continue
+		}
+		underGroup := false
+		for group := range groups {
+			if strings.HasPrefix(full, group+".") {
+				underGroup = true
+				break
+			}
+		}
+		if underGroup {
+			continue
+		}
+		actual, caseMatch := "", ""
+		for known := range decoded {
+			if strings.EqualFold(known, full) {
+				actual, caseMatch = known, full
+			}
+		}
+		if caseMatch != "" {
+			return nil, fmt.Errorf("config key %s should be %s (keys are case sensitive)", caseMatch, actual)
+		}
+		unknown = append(unknown, full)
+	}
+	if len(unknown) > 0 {
+		return nil, fmt.Errorf("unknown config key %s, check for typos", strings.Join(unknown, ", "))
 	}
 
 	timeoutMs, err := getIntValue(conf.Scan.Timeout)

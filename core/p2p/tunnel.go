@@ -1546,10 +1546,6 @@ func insertAuthHeader(req, authHeader string) string {
 	return strings.Join(result, "\r\n")
 }
 
-func (t *PTCPTunnel) Snapshot(channel int) ([]byte, error) {
-	return t.SnapshotTimeout(channel, 10*time.Second)
-}
-
 func (t *PTCPTunnel) SnapshotTimeout(channel int, timeout time.Duration) ([]byte, error) {
 	if channel <= 0 {
 		channel = 1
