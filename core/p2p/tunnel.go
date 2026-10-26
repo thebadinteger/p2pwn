@@ -29,29 +29,6 @@ type PTCPTunnel struct {
 	user     string
 	pass     string
 	sendMu   sync.Mutex
-	recvMu   sync.Mutex
-}
-
-func (t *PTCPTunnel) takeRecvBuf(realm uint32) []byte {
-	t.recvMu.Lock()
-	defer t.recvMu.Unlock()
-	data := t.recvBufs[realm]
-	if data != nil {
-		delete(t.recvBufs, realm)
-	}
-	return data
-}
-
-func (t *PTCPTunnel) parkRecvBuf(realm uint32, payload []byte) {
-	t.recvMu.Lock()
-	t.recvBufs[realm] = append(t.recvBufs[realm], payload...)
-	t.recvMu.Unlock()
-}
-
-func (t *PTCPTunnel) putRecvBuf(realm uint32, data []byte) {
-	t.recvMu.Lock()
-	t.recvBufs[realm] = data
-	t.recvMu.Unlock()
 }
 
 func newTunnel(c *DHClient, conn *net.UDPConn, addr string, session *PTCPSession) *PTCPTunnel {
@@ -69,8 +46,9 @@ func newTunnel(c *DHClient, conn *net.UDPConn, addr string, session *PTCPSession
 
 func (t *PTCPTunnel) readOneDataForRealm(realm uint32, timeout time.Duration) ([]byte, error) {
 	conn := t.conn
-	data := t.takeRecvBuf(realm)
-	if data != nil {
+	if len(t.recvBufs[realm]) > 0 {
+		data := t.recvBufs[realm]
+		delete(t.recvBufs, realm)
 		return data, nil
 	}
 	conn.SetReadDeadline(time.Now().Add(timeout))
@@ -106,7 +84,7 @@ func (t *PTCPTunnel) readOneDataForRealm(realm uint32, timeout time.Duration) ([
 				continue
 			}
 			if r != realm {
-				t.parkRecvBuf(r, payload)
+				t.recvBufs[r] = append(t.recvBufs[r], payload...)
 				t.sendACK()
 				continue
 			}
@@ -153,8 +131,9 @@ func (t *PTCPTunnel) ReadData(timeout time.Duration) ([]byte, error) {
 	conn := t.conn
 	var out []byte
 
-	if b := t.takeRecvBuf(t.realm); b != nil {
-		out = b
+	if len(t.recvBufs[t.realm]) > 0 {
+		out = t.recvBufs[t.realm]
+		delete(t.recvBufs, t.realm)
 	}
 
 	conn.SetReadBuffer(512 * 1024)
@@ -217,7 +196,7 @@ func (t *PTCPTunnel) ReadData(timeout time.Duration) ([]byte, error) {
 				continue
 			}
 			if realm != t.realm {
-				t.parkRecvBuf(realm, payload)
+				t.recvBufs[realm] = append(t.recvBufs[realm], payload...)
 				if ackNow {
 					t.sendACK()
 				}
@@ -370,8 +349,9 @@ func (t *PTCPTunnel) readDataSkipDisc(realm uint32, timeout time.Duration) ([]by
 	conn := t.conn
 	deadline := time.Now().Add(timeout)
 
-	data := t.takeRecvBuf(realm)
-	if data != nil {
+	if len(t.recvBufs[realm]) > 0 {
+		data := t.recvBufs[realm]
+		delete(t.recvBufs, realm)
 		return data, nil
 	}
 
@@ -412,7 +392,7 @@ func (t *PTCPTunnel) readDataSkipDisc(realm uint32, timeout time.Duration) ([]by
 				continue
 			}
 			if r != realm {
-				t.parkRecvBuf(r, payload)
+				t.recvBufs[r] = append(t.recvBufs[r], payload...)
 				t.sendACK()
 				continue
 			}
@@ -561,8 +541,9 @@ func (t *PTCPTunnel) readHTTPPayload(realm uint32, out []byte, timeout time.Dura
 		conn.SetReadDeadline(time.Time{})
 	}
 
-	data := t.takeRecvBuf(realm)
-	if data != nil {
+	if len(t.recvBufs[realm]) > 0 {
+		data := t.recvBufs[realm]
+		delete(t.recvBufs, realm)
 		return data, nil
 	}
 
@@ -607,7 +588,7 @@ func (t *PTCPTunnel) readHTTPPayload(realm uint32, out []byte, timeout time.Dura
 				continue
 			}
 			if r != realm {
-				t.parkRecvBuf(r, payload)
+				t.recvBufs[r] = append(t.recvBufs[r], payload...)
 				t.sendACK()
 				continue
 			}
@@ -760,7 +741,8 @@ func (c *DHIPClient) send(method string, params any, id int, object any, sid ...
 
 func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 	deadline := time.Now().Add(timeout)
-	buf := c.tunnel.takeRecvBuf(c.realm)
+	buf := c.tunnel.recvBufs[c.realm]
+	delete(c.tunnel.recvBufs, c.realm)
 
 	var magicIdx int
 	for {
@@ -771,7 +753,7 @@ func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 		chunk, err := c.tunnel.readOneDataForRealm(c.realm, time.Until(deadline))
 		if err != nil {
 			if len(buf) > 0 {
-				c.tunnel.putRecvBuf(c.realm, buf)
+				c.tunnel.recvBufs[c.realm] = buf
 			}
 			return nil, fmt.Errorf("dhip read header: %w", err)
 		}
@@ -790,7 +772,7 @@ func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 		chunk, err := c.tunnel.readOneDataForRealm(c.realm, time.Until(deadline))
 		if err != nil {
 			if len(buf) > 0 {
-				c.tunnel.putRecvBuf(c.realm, buf)
+				c.tunnel.recvBufs[c.realm] = buf
 			}
 			return nil, fmt.Errorf("dhip read body: %w", err)
 		}
@@ -799,7 +781,7 @@ func (c *DHIPClient) readPacket(timeout time.Duration) (map[string]any, error) {
 
 	bodyRaw := buf[32:totalNeeded]
 	if len(buf) > totalNeeded {
-		c.tunnel.putRecvBuf(c.realm, buf[totalNeeded:])
+		c.tunnel.recvBufs[c.realm] = buf[totalNeeded:]
 	}
 
 	if bodyLen == 0 {
@@ -1546,6 +1528,10 @@ func insertAuthHeader(req, authHeader string) string {
 	return strings.Join(result, "\r\n")
 }
 
+func (t *PTCPTunnel) Snapshot() ([]byte, error) {
+	return t.SnapshotTimeout(1, 10*time.Second)
+}
+
 func (t *PTCPTunnel) SnapshotTimeout(channel int, timeout time.Duration) ([]byte, error) {
 	if channel <= 0 {
 		channel = 1
@@ -1835,26 +1821,21 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 		}
 		body := extractBody(r.resp)
 		kv := parseKV(r.resp)
-		for k, v := range kv {
-			switch strings.ToLower(k) {
-			case "videoinputchannels", "videoinchannels", "channelnum",
-				"videoinputchannelnum", "maxvideoinputchannels":
-				if n, err := strconv.Atoi(strings.Trim(v, `"`)); err == nil && n > channels {
-					channels = n
-				}
-			}
+		if m := kv["deviceType"]; m != "" && !hasErrPrefix(m) {
+			model = m
+			break
 		}
-		for _, cand := range []string{
-			kv["deviceType"], kv["model"],
-			xmlTag(body, "deviceType"), xmlTag(body, "model"),
-			kv["type"], xmlTag(body, "type"),
-		} {
-			if cand != "" && !hasErrPrefix(cand) && plausibleModel(cand) {
-				model = cand
-				break
-			}
+		if m := kv["model"]; m != "" && !hasErrPrefix(m) {
+			model = m
+			break
 		}
-		if model != "" {
+
+		if m := xmlTag(body, "deviceType"); m != "" && !hasErrPrefix(m) {
+			model = m
+			break
+		}
+		if m := xmlTag(body, "model"); m != "" && !hasErrPrefix(m) {
+			model = m
 			break
 		}
 	}
@@ -1872,17 +1853,20 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 				continue
 			}
 			body := extractBody(r.resp)
-			kv := parseKV(r.resp)
-			for _, cand := range []string{
-				xmlTag(body, "type"), kv["type"], kv["deviceType"],
-				strings.TrimSpace(string(body)),
-			} {
-				if cand != "" && !hasErrPrefix(cand) && plausibleModel(cand) {
-					model = cand
-					break
+			if m := strings.TrimSpace(string(body)); m != "" && !hasErrPrefix(m) {
+
+				if v := xmlTag(body, "type"); v != "" {
+					m = v
 				}
-			}
-			if model != "" {
+				// keep the bare value
+				if kv := parseKV(r.resp); len(kv) > 0 {
+					if v := kv["type"]; v != "" {
+						m = v
+					} else if v := kv["deviceType"]; v != "" {
+						m = v
+					}
+				}
+				model = m
 				break
 			}
 		}
@@ -1920,187 +1904,19 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 
 	r := doGet("/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle")
 	if !r.nvrPage && r.resp != nil {
-		body := extractBody(r.resp)
-		if c := countIndexedKeys(body, "ChannelTitle"); c > channels {
-			channels = c
-		}
-		if c := bytes.Count(r.resp, []byte("<table")); c > channels {
+		if c := bytes.Count(r.resp, []byte("<table")); c > 0 {
 			channels = c
 		}
 	}
-	if t.user != "" && looksLikeRecorder(model) {
-		if c := t.deviceChannelsViaDHIP(); c > channels {
-			channels = c
-		}
-		if channels <= 1 {
-			if _, _, c, err := NewSDKClient(t, t.user, t.pass).GetDeviceInfo(); err == nil && c > channels {
-				channels = c
-			}
-		}
-	}
-	if channels < 1 {
+	if channels == 0 {
 		channels = 1
 	}
 
 	return model, channels, firmware, nil
 }
 
-func countIndexedKeys(body []byte, key string) int {
-	s := string(body)
-	prefix := key + "["
-	seen := make(map[int]struct{})
-	for {
-		i := strings.Index(s, prefix)
-		if i < 0 {
-			break
-		}
-		s = s[i+len(prefix):]
-		j := 0
-		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
-			j++
-		}
-		if j == 0 {
-			continue
-		}
-		if n, err := strconv.Atoi(s[:j]); err == nil {
-			seen[n] = struct{}{}
-		}
-	}
-	return len(seen)
-}
-
-func looksLikeRecorder(model string) bool {
-	m := strings.ToUpper(model)
-	for _, tag := range []string{"NVR", "XVR", "DVR", "HCVR", "HVR"} {
-		if strings.Contains(m, tag) {
-			return true
-		}
-	}
-	return false
-}
-
-func (t *PTCPTunnel) deviceChannelsViaDHIP() int {
-	for _, port := range []int{5000, 80} {
-		dhip, err := t.NewDHIPClientOnPort(port)
-		if err != nil {
-			continue
-		}
-		if err := dhip.LoginNormal(t.user, t.pass); err != nil {
-			dhip.Close()
-			continue
-		}
-		channels := 0
-		if r, err := dhip.Call("configManager.getConfig", map[string]any{"name": "ChannelTitle"}, 20, nil, nil); err == nil {
-			channels = dhipTableLen(r)
-		}
-		if channels <= 1 {
-			if r, err := dhip.Call("magicBox.getSystemInfo", nil, 21, nil, nil); err == nil {
-				if c := dhipInfoChannels(r); c > channels {
-					channels = c
-				}
-			}
-		}
-		dhip.Close()
-		if channels > 1 {
-			return channels
-		}
-	}
-	return 0
-}
-
-func dhipTableLen(r map[string]any) int {
-	for _, key := range []string{"params", "result"} {
-		obj, _ := r[key].(map[string]any)
-		if obj == nil {
-			continue
-		}
-		switch table := obj["table"].(type) {
-		case []any:
-			if len(table) > 1 {
-				return len(table)
-			}
-		case map[string]any:
-			if list, ok := table["ChannelTitle"].([]any); ok && len(list) > 1 {
-				return len(list)
-			}
-			n, numeric := 0, true
-			for k := range table {
-				if _, err := strconv.Atoi(k); err != nil {
-					numeric = false
-					break
-				}
-				n++
-			}
-			if numeric && n > 1 {
-				return n
-			}
-		}
-	}
-	return 0
-}
-
-func dhipInfoChannels(r map[string]any) int {
-	best := 0
-	var walk func(any)
-	walk = func(v any) {
-		switch x := v.(type) {
-		case map[string]any:
-			for k, val := range x {
-				switch strings.ToLower(k) {
-				case "videoinputchannels", "videoinchannels", "channelnum", "videoinputchannelnum":
-					if n, ok := val.(float64); ok && int(n) > best {
-						best = int(n)
-					}
-				}
-				walk(val)
-			}
-		case []any:
-			for _, item := range x {
-				walk(item)
-			}
-		}
-	}
-	walk(r)
-	return best
-}
-
-func isTimeoutErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "timeout") || strings.Contains(s, "deadline exceeded")
-}
-
 func hasErrPrefix(s string) bool {
 	return strings.HasPrefix(s, "Error") || strings.Contains(s, "Bad Request")
-}
-
-func plausibleModel(s string) bool {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
-	}
-	lower := strings.ToLower(s)
-	for _, bad := range []string{"<", ">", "html", "<?xml", "302 found", "404 not found", "not found", "bad request", "error"} {
-		if strings.Contains(lower, bad) {
-			return false
-		}
-	}
-	digits := 0
-	runes := []rune(s)
-	for _, r := range runes {
-		if r >= '0' && r <= '9' {
-			digits++
-		}
-	}
-	if digits == len(runes) {
-		return false
-	}
-	if len(runes) > 64 {
-		return false
-	}
-	return true
 }
 
 // fetch the model over DHIP
@@ -2181,4 +1997,12 @@ func parseContentLength(s string) int {
 
 func contains(data []byte, substr string) bool {
 	return bytes.Contains(data, []byte(substr))
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "timeout") || strings.Contains(s, "deadline exceeded")
 }
