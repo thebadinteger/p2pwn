@@ -14,7 +14,6 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
-	"time"
 
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -110,7 +109,7 @@ func GetP2PDec(key []byte, nonce int, data string) string {
 }
 
 func GetP2PAuth(username string, key []byte, nonce int, payload, randsalt string) string {
-	return GetP2PAuthAt(username, key, nonce, payload, randsalt, time.Now().Unix())
+	return GetP2PAuthAt(username, key, nonce, payload, randsalt, nowAdjusted().Unix())
 }
 
 func GetP2PAuthAt(username string, key []byte, nonce int, payload, randsalt string, created int64) string {

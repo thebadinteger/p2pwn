@@ -155,6 +155,10 @@ func parseDHResponse(data []byte) (*DHResponse, error) {
 		resp.XMLBody = parseXMLMap(parts[1])
 	}
 
+	if resp.Code == 401 || resp.Code == 403 {
+		maybeUpdateTimeOffset(resp)
+	}
+
 	return resp, nil
 }
 
@@ -225,7 +229,7 @@ func (c *DHClient) newChannelIdentity(prof *CloudProfile) *channelIdentity {
 		identify = strconv.AppendInt(identify, int64(b>>4), 16)
 		identify = strconv.AppendInt(identify, int64(b&0x0f), 16)
 	}
-	return &channelIdentity{identify: string(identify), created: time.Now().Unix(), cseq: prof.nextCSeq()}
+	return &channelIdentity{identify: string(identify), created: nowAdjusted().Unix(), cseq: prof.nextCSeq()}
 }
 
 // render the p2p-channel XML for one crypto generation

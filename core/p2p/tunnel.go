@@ -1796,16 +1796,75 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 		resp    []byte
 		nvrPage bool
 	}
+	cgiCache := make(map[string]getResult)
 	doGet := func(path string) getResult {
+		if r, ok := cgiCache[path]; ok {
+			return r
+		}
+		var r getResult
 		req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n", path)
 		resp, e := t.DoHTTPAuth([]byte(req), 5*time.Second)
-		if e != nil {
-			return getResult{}
+		if e == nil {
+			if isNVRErrorPage(resp) {
+				r.nvrPage = true
+			} else {
+				r.resp = resp
+			}
 		}
-		if isNVRErrorPage(resp) {
-			return getResult{nvrPage: true}
+		cgiCache[path] = r
+		return r
+	}
+
+	detectCGIChannels := func() int {
+		best := 0
+		for _, path := range []string{
+			"/cgi-bin/magicBox.cgi?action=getSystemInfo",
+			"/cgi-bin/configManager.cgi?action=getConfig&name=General.SystemInfo",
+		} {
+			r := doGet(path)
+			if r.nvrPage || r.resp == nil {
+				continue
+			}
+			for k, v := range parseKV(r.resp) {
+				switch strings.ToLower(k) {
+				case "videoinputchannels", "videoinchannels", "channelnum",
+					"videoinputchannelnum", "maxvideoinputchannels":
+					if n, err := strconv.Atoi(strings.Trim(v, `"`)); err == nil && n > best {
+						best = n
+					}
+				}
+			}
 		}
-		return getResult{resp: resp}
+		r := doGet("/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle")
+		if !r.nvrPage && r.resp != nil {
+			body := extractBody(r.resp)
+			if c := countIndexedKeys(body, "ChannelTitle"); c > best {
+				best = c
+			}
+			if c := bytes.Count(r.resp, []byte("<table")); c > best {
+				best = c
+			}
+		}
+		return best
+	}
+
+	// dhip cgi sdk fallback order
+	channels = 0
+	if t.user != "" {
+		channels = t.deviceChannelsViaDHIP()
+	}
+	if channels == 0 {
+		channels = detectCGIChannels()
+	}
+	if channels == 0 && t.user != "" {
+		sdk := NewSDKClient(t, t.user, t.pass)
+		if _, _, c, err := sdk.GetDeviceInfo(); err == nil && c > 0 {
+			channels = c
+		}
+		sdk.Close()
+	}
+	if channels < 1 {
+		channels = 1
 	}
 
 	for _, path := range []string{
@@ -1821,21 +1880,17 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 		}
 		body := extractBody(r.resp)
 		kv := parseKV(r.resp)
-		if m := kv["deviceType"]; m != "" && !hasErrPrefix(m) {
-			model = m
-			break
+		for _, cand := range []string{
+			kv["deviceType"], kv["model"],
+			xmlTag(body, "deviceType"), xmlTag(body, "model"),
+			kv["type"], xmlTag(body, "type"),
+		} {
+			if cand != "" && !hasErrPrefix(cand) && plausibleModel(cand) {
+				model = cand
+				break
+			}
 		}
-		if m := kv["model"]; m != "" && !hasErrPrefix(m) {
-			model = m
-			break
-		}
-
-		if m := xmlTag(body, "deviceType"); m != "" && !hasErrPrefix(m) {
-			model = m
-			break
-		}
-		if m := xmlTag(body, "model"); m != "" && !hasErrPrefix(m) {
-			model = m
+		if model != "" {
 			break
 		}
 	}
@@ -1853,20 +1908,17 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 				continue
 			}
 			body := extractBody(r.resp)
-			if m := strings.TrimSpace(string(body)); m != "" && !hasErrPrefix(m) {
-
-				if v := xmlTag(body, "type"); v != "" {
-					m = v
+			kv := parseKV(r.resp)
+			for _, cand := range []string{
+				xmlTag(body, "type"), kv["type"], kv["deviceType"],
+				strings.TrimSpace(string(body)),
+			} {
+				if cand != "" && !hasErrPrefix(cand) && plausibleModel(cand) {
+					model = cand
+					break
 				}
-				// keep the bare value
-				if kv := parseKV(r.resp); len(kv) > 0 {
-					if v := kv["type"]; v != "" {
-						m = v
-					} else if v := kv["deviceType"]; v != "" {
-						m = v
-					}
-				}
-				model = m
+			}
+			if model != "" {
 				break
 			}
 		}
@@ -1902,21 +1954,145 @@ func (t *PTCPTunnel) GetDeviceInfo() (model string, channels int, firmware strin
 		}
 	}
 
-	r := doGet("/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle")
-	if !r.nvrPage && r.resp != nil {
-		if c := bytes.Count(r.resp, []byte("<table")); c > 0 {
-			channels = c
+	return model, channels, firmware, nil
+}
+
+func countIndexedKeys(body []byte, key string) int {
+	s := string(body)
+	prefix := key + "["
+	seen := make(map[int]struct{})
+	for {
+		i := strings.Index(s, prefix)
+		if i < 0 {
+			break
+		}
+		s = s[i+len(prefix):]
+		j := 0
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j == 0 {
+			continue
+		}
+		if n, err := strconv.Atoi(s[:j]); err == nil {
+			seen[n] = struct{}{}
 		}
 	}
-	if channels == 0 {
-		channels = 1
-	}
+	return len(seen)
+}
 
-	return model, channels, firmware, nil
+func (t *PTCPTunnel) deviceChannelsViaDHIP() int {
+	for _, port := range []int{5000, 80} {
+		dhip, err := t.NewDHIPClientOnPort(port)
+		if err != nil {
+			continue
+		}
+		if err := dhip.LoginNormal(t.user, t.pass); err != nil {
+			dhip.Close()
+			continue
+		}
+		channels := 0
+		if r, err := dhip.Call("configManager.getConfig", map[string]any{"name": "ChannelTitle"}, 20, nil, nil); err == nil {
+			channels = dhipTableLen(r)
+		}
+		if r, err := dhip.Call("magicBox.getSystemInfo", nil, 21, nil, nil); err == nil {
+			if c := dhipInfoChannels(r); c > channels {
+				channels = c
+			}
+		}
+		dhip.Close()
+		if channels > 0 {
+			return channels
+		}
+	}
+	return 0
+}
+
+func dhipTableLen(r map[string]any) int {
+	for _, key := range []string{"params", "result"} {
+		obj, _ := r[key].(map[string]any)
+		if obj == nil {
+			continue
+		}
+		switch table := obj["table"].(type) {
+		case []any:
+			if len(table) > 0 {
+				return len(table)
+			}
+		case map[string]any:
+			if list, ok := table["ChannelTitle"].([]any); ok && len(list) > 0 {
+				return len(list)
+			}
+			n, numeric := 0, true
+			for k := range table {
+				if _, err := strconv.Atoi(k); err != nil {
+					numeric = false
+					break
+				}
+				n++
+			}
+			if numeric && n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func dhipInfoChannels(r map[string]any) int {
+	best := 0
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, val := range x {
+				switch strings.ToLower(k) {
+				case "videoinputchannels", "videoinchannels", "channelnum", "videoinputchannelnum":
+					if n, ok := val.(float64); ok && int(n) > best {
+						best = int(n)
+					}
+				}
+				walk(val)
+			}
+		case []any:
+			for _, item := range x {
+				walk(item)
+			}
+		}
+	}
+	walk(r)
+	return best
 }
 
 func hasErrPrefix(s string) bool {
 	return strings.HasPrefix(s, "Error") || strings.Contains(s, "Bad Request")
+}
+
+func plausibleModel(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	lower := strings.ToLower(s)
+	for _, bad := range []string{"<", ">", "html", "<?xml", "302 found", "404 not found", "not found", "bad request", "error"} {
+		if strings.Contains(lower, bad) {
+			return false
+		}
+	}
+	digits := 0
+	runes := []rune(s)
+	for _, r := range runes {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	if digits == len(runes) {
+		return false
+	}
+	if len(runes) > 64 {
+		return false
+	}
+	return true
 }
 
 // fetch the model over DHIP

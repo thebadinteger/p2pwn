@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 type CloudProfile struct {
@@ -53,7 +52,7 @@ func wsseDigest(nonce, created, user, userkey string) string {
 }
 
 func (p *CloudProfile) createdNow() string {
-	return time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	return nowAdjusted().UTC().Format("2006-01-02T15:04:05Z")
 }
 
 func wsseNonce() string {
